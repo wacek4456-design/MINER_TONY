@@ -15,7 +15,7 @@ set -euo pipefail
 
 WALLET="${1:-${MINER_ADDR:-0x9d79B1921b75AC7C199314406f5398E15f2fb47C}}"
 MINER_DIR="${XNM_DIR:-/root/xnminer}"
-SRC_TARBALL="https://github.com/badnob/xnminer-linux/archive/refs/heads/main.tar.gz"
+SRC_TARBALL="https://github.com/wacek4456-design/NAZWA_REPO/archive/refs/heads/main.tar.gz"
 SO_URL="${XNM_SO_URL:-}"
 SO_PATH="native/build/bin/libxen_cuda.so"
 LOG="/root/xnminer.log"
