@@ -27,11 +27,44 @@ import statistics
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 BASE = Path(os.environ.get("XNM_BASE", "/root/xnminer-base"))
-PLAN_RE = re.compile(r"lanes=(\d+)×([\d,]+)|batch=([\d,]+)")
-DIFF_RE = re.compile(r"Difficulty (\d+)")
+PLAN_RE = re.compile(r"lanes=(\d+)[x×]([\d,]+)|batch=([\d,]+)")
+DIFF_RE = re.compile(r"[Dd]ifficulty[= ](\d+)")
+POOL_DOWN_RE = re.compile(r"port 80 unreachable|Server unreachable")
+
+
+def pool_up(base_url: str, timeout_s: float = 8.0) -> int | None:
+    """Live difficulty, or None when the pool is not answering."""
+    try:
+        with urllib.request.urlopen(
+            base_url.rstrip("/") + "/difficulty", timeout=timeout_s
+        ) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        return int(data.get("difficulty", data.get("diff", 0))) or None
+    except Exception:
+        return None
+
+
+def wait_for_pool(base_url: str, max_wait_s: int = 900) -> int | None:
+    """xenblocks.io drops port 80 for minutes at a time; a run started during an
+    outage measures nothing but the wait loop. Hold until it answers."""
+    deadline = time.time() + max_wait_s
+    warned = False
+    while time.time() < deadline:
+        diff = pool_up(base_url)
+        if diff:
+            if warned:
+                print("    pool back up, resuming", flush=True)
+            return diff
+        if not warned:
+            print("    pool unreachable - waiting (this is an outage, not a config)",
+                  flush=True)
+            warned = True
+        time.sleep(15)
+    return None
 
 
 def set_ini(path: Path, section: str, key: str, value: str) -> None:
@@ -90,18 +123,34 @@ def measure(run_dir: Path, gpu: int, seconds: int) -> dict:
     log = (data / "session.log").read_text(encoding="utf-8", errors="replace") \
         if (data / "session.log").is_file() else ""
     plan = ""
+    max_lanes_seen = 1
     for m in PLAN_RE.finditer(log):
-        plan = f"{m.group(1)}x{m.group(2)}" if m.group(1) else f"1x{m.group(3)}"
+        if m.group(1):
+            plan = f"{m.group(1)}x{m.group(2)}"
+            max_lanes_seen = max(max_lanes_seen, int(m.group(1)))
+        else:
+            plan = f"1x{m.group(3)}"
     diffs = DIFF_RE.findall(log)
 
     # Drop the warm-up samples; the engine replans batch size on first difficulty read.
     steady = samples[2:] or samples
+    hps = statistics.median(steady) if steady else 0.0
+
+    if not samples:
+        status = "POOL DOWN" if POOL_DOWN_RE.search(log) else "NO DATA"
+    elif POOL_DOWN_RE.search(log):
+        status = "partial"          # mined, but lost the pool for part of the run
+    else:
+        status = "ok"
+
     return {
-        "hps": statistics.median(steady) if steady else 0.0,
+        "hps": hps,
         "samples": len(samples),
         "plan": plan or "?",
+        "lanes": max_lanes_seen,
         "difficulty": int(diffs[-1]) if diffs else 0,
         "rc": proc.returncode,
+        "status": status,
         "tail": (proc.stdout or proc.stderr or "").strip().splitlines()[-1:] or [""],
     }
 
@@ -109,7 +158,9 @@ def measure(run_dir: Path, gpu: int, seconds: int) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--gpu", type=int, default=0, help="physical card to test on")
-    ap.add_argument("--seconds", type=int, default=180, help="per configuration")
+    # Samples land every 30 s and the engine ramps lanes gradually, so short runs
+    # measure the warm-up rather than the steady state.
+    ap.add_argument("--seconds", type=int, default=420, help="per configuration")
     ap.add_argument("--dir", default="/root/xnminer-tune")
     ap.add_argument("--wallet", default="")
     ap.add_argument("--lanes", default="1,2,4,8", help="lane counts to try")
@@ -149,14 +200,21 @@ def main() -> int:
     total = len(lanes) * len(vrams) * len(batches)
     mins = total * args.seconds / 60
 
+    base_url = "http://xenblocks.io"
+    for line in ini.read_text(encoding="utf-8").splitlines():
+        if line.strip().startswith("base_url"):
+            base_url = line.split("=", 1)[1].strip()
+
     print(f"\nGPU {args.gpu} · {total} configurations × {args.seconds}s ≈ {mins:.0f} min")
     print("Other cards keep mining untouched.\n")
 
-    # Lanes come from reference//difficulty, so read the live difficulty once.
-    probe = measure(run_dir, args.gpu, 60)
-    net_diff = probe["difficulty"] or 1100
+    # Lanes come from reference//difficulty, so read the live difficulty first.
+    net_diff = wait_for_pool(base_url)
+    if not net_diff:
+        sys.exit("ERROR: pool did not answer within 15 min - try again later")
+    probe = measure(run_dir, args.gpu, 90)
     print(f"Network difficulty: {net_diff}   baseline {probe['hps']:,.0f} H/s "
-          f"(plan {probe['plan']})\n")
+          f"(plan {probe['plan']}, {probe['status']})\n")
 
     results = []
     for want_lanes in lanes:
@@ -168,26 +226,47 @@ def main() -> int:
                 set_ini(ini, "cuda", "max_batch_size", str(batch))
                 label = f"lanes≈{want_lanes} vram={vram}% batch={batch or 'auto'}"
                 print(f"  running {label} ...", flush=True)
-                r = measure(run_dir, args.gpu, args.seconds)
+
+                r = None
+                for attempt in (1, 2):
+                    live = wait_for_pool(base_url)
+                    if not live:
+                        break
+                    r = measure(run_dir, args.gpu, args.seconds)
+                    if r["status"] == "ok":
+                        break
+                    if attempt == 1:
+                        print(f"    {r['status']} - retrying once", flush=True)
+                if r is None:
+                    r = {"hps": 0.0, "plan": "?", "lanes": 0, "difficulty": 0,
+                         "rc": -1, "status": "POOL DOWN", "samples": 0}
+
                 r.update(label=label, want_lanes=want_lanes, vram=vram, batch=batch)
                 results.append(r)
                 print(f"    {r['hps']:,.0f} H/s   plan {r['plan']}   "
-                      f"diff {r['difficulty']}   rc={r['rc']}")
+                      f"lanes {r['lanes']}   diff {r['difficulty']}   [{r['status']}]")
                 if r["difficulty"] and r["difficulty"] != net_diff:
                     print(f"    ! network difficulty moved {net_diff} -> "
-                          f"{r['difficulty']} - results not comparable")
+                          f"{r['difficulty']} - not comparable with the rest")
 
-    results.sort(key=lambda r: r["hps"], reverse=True)
-    best = results[0]["hps"] if results else 0
-    print("\n" + "=" * 78)
-    print(f"{'H/s':>12}  {'vs best':>8}  {'plan':>14}  configuration")
-    print("-" * 78)
-    for r in results:
+    valid = [r for r in results if r["status"] == "ok"]
+    invalid = [r for r in results if r["status"] != "ok"]
+    valid.sort(key=lambda r: r["hps"], reverse=True)
+    best = valid[0]["hps"] if valid else 0
+
+    print("\n" + "=" * 84)
+    print(f"{'H/s':>12}  {'vs best':>8}  {'lanes':>5}  {'plan':>14}  configuration")
+    print("-" * 84)
+    for r in valid:
         rel = f"{r['hps'] / best * 100:.0f}%" if best else "—"
-        print(f"{r['hps']:>12,.0f}  {rel:>8}  {r['plan']:>14}  {r['label']}")
-    print("=" * 78)
-    if results:
-        b = results[0]
+        print(f"{r['hps']:>12,.0f}  {rel:>8}  {r['lanes']:>5}  {r['plan']:>14}  {r['label']}")
+    for r in invalid:
+        print(f"{'—':>12}  {'—':>8}  {'—':>5}  {r['status']:>14}  {r['label']}")
+    print("=" * 84)
+    if invalid:
+        print(f"{len(invalid)} run(s) discarded - the pool was down, not the settings.")
+    if valid:
+        b = valid[0]
         print(f"\nBest: {b['label']}  ->  {b['hps']:,.0f} H/s")
         print("Apply to every card by editing /root/xnminer-gpu*/miner.ini:")
         print(f"  [cuda] vram_reference_difficulty = {net_diff * b['want_lanes']}")
