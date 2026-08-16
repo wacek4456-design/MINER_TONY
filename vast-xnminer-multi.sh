@@ -15,6 +15,8 @@ WALLET="${1:-${MINER_ADDR:-0x9d79B1921b75AC7C199314406f5398E15f2fb47C}}"
 BASE="${XNM_BASE:-/root/xnminer-base}"
 SRC_TARBALL="https://github.com/badnob/xnminer-linux/archive/refs/heads/main.tar.gz"
 SESSION="xnm"
+WARN_TEMP="${XNM_WARN_TEMP:-78}"
+MAX_TEMP="${XNM_MAX_TEMP:-82}"
 
 log() { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -173,6 +175,11 @@ for i in $(seq 0 $((GPUS - 1))); do
   sed -i "s|^address =.*|address = ${WALLET}|" miner.ini
   sed -i "s|^worker =.*|worker = xnminer-gpu${i}|" miner.ini
   sed -i "s|^woodyminer_custom_name =.*|woodyminer_custom_name = xnminer-gpu${i}|" miner.ini
+  # Upstream defaults (72/75) are set for a quiet desktop. Rented 3090s sit at
+  # 70-75C under load, so they spend their time derating batches and cooling
+  # down instead of hashing. These are still well under the card's own limits.
+  sed -i "s|^warn_gpu_temp_c.*|warn_gpu_temp_c = ${WARN_TEMP}|" miner.ini
+  sed -i "s|^max_gpu_temp_c.*|max_gpu_temp_c = ${MAX_TEMP}|" miner.ini
   echo "  GPU${i} -> ${DIR}"
   cd "$BASE"
 done
