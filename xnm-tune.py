@@ -94,7 +94,7 @@ def set_ini(path: Path, section: str, key: str, value: str) -> None:
     path.write_text("\n".join(out) + "\n", encoding="utf-8")
 
 
-def measure(run_dir: Path, gpu: int, seconds: int) -> dict:
+def measure(run_dir: Path, gpu: int, seconds: int, offline: bool = True) -> dict:
     """One timed run; returns median steady-state H/s plus the chosen plan."""
     data = run_dir / "data"
     for name in ("session_timelapse.jsonl", "session.log", "miner.lock"):
@@ -136,8 +136,12 @@ def measure(run_dir: Path, gpu: int, seconds: int) -> dict:
     steady = samples[2:] or samples
     hps = statistics.median(steady) if steady else 0.0
 
+    # In offline mode the pool is deliberately unreachable, so "Server
+    # unreachable" in the log is expected and says nothing about the run.
     if not samples:
-        status = "POOL DOWN" if POOL_DOWN_RE.search(log) else "NO DATA"
+        status = "NO DATA"
+    elif offline:
+        status = "ok"
     elif POOL_DOWN_RE.search(log):
         status = "partial"          # mined, but lost the pool for part of the run
     else:
@@ -166,6 +170,8 @@ def main() -> int:
     ap.add_argument("--lanes", default="1,2,4,8", help="lane counts to try")
     ap.add_argument("--vram", default="69.09,92", help="target_vram_pct values")
     ap.add_argument("--batches", default="0", help="max_batch_size values, 0 = auto")
+    ap.add_argument("--difficulty", type=int, default=1100,
+                    help="Argon2 memory_cost to benchmark at; pinned for every run")
     args = ap.parse_args()
 
     run_dir = Path(args.dir)
@@ -200,21 +206,23 @@ def main() -> int:
     total = len(lanes) * len(vrams) * len(batches)
     mins = total * args.seconds / 60
 
-    base_url = "http://xenblocks.io"
-    for line in ini.read_text(encoding="utf-8").splitlines():
-        if line.strip().startswith("base_url"):
-            base_url = line.split("=", 1)[1].strip()
+    # Network difficulty swings (2100 -> 5100 -> 1100 within one sweep) and the
+    # pool drops out for minutes at a time. Both make runs incomparable: memory
+    # per hash and lane count are derived from the difficulty. So point the
+    # benchmark at a dead address - the miner then mines at [mining] memory_cost
+    # forever, identical for every configuration. It submits nothing, which is
+    # exactly right for a throughput measurement.
+    net_diff = args.difficulty
+    set_ini(ini, "server", "base_url", "http://127.0.0.1:9")
+    set_ini(ini, "mining", "memory_cost", str(net_diff))
 
     print(f"\nGPU {args.gpu} · {total} configurations × {args.seconds}s ≈ {mins:.0f} min")
+    print(f"Offline benchmark, difficulty pinned at {net_diff} - nothing is submitted.")
     print("Other cards keep mining untouched.\n")
 
-    # Lanes come from reference//difficulty, so read the live difficulty first.
-    net_diff = wait_for_pool(base_url)
-    if not net_diff:
-        sys.exit("ERROR: pool did not answer within 15 min - try again later")
-    probe = measure(run_dir, args.gpu, 90)
-    print(f"Network difficulty: {net_diff}   baseline {probe['hps']:,.0f} H/s "
-          f"(plan {probe['plan']}, {probe['status']})\n")
+    probe = measure(run_dir, args.gpu, 120)
+    print(f"Baseline: {probe['hps']:,.0f} H/s  (plan {probe['plan']}, "
+          f"lanes {probe['lanes']}, {probe['status']})\n")
 
     results = []
     for want_lanes in lanes:
@@ -227,27 +235,17 @@ def main() -> int:
                 label = f"lanes≈{want_lanes} vram={vram}% batch={batch or 'auto'}"
                 print(f"  running {label} ...", flush=True)
 
-                r = None
                 for attempt in (1, 2):
-                    live = wait_for_pool(base_url)
-                    if not live:
-                        break
                     r = measure(run_dir, args.gpu, args.seconds)
                     if r["status"] == "ok":
                         break
                     if attempt == 1:
                         print(f"    {r['status']} - retrying once", flush=True)
-                if r is None:
-                    r = {"hps": 0.0, "plan": "?", "lanes": 0, "difficulty": 0,
-                         "rc": -1, "status": "POOL DOWN", "samples": 0}
 
                 r.update(label=label, want_lanes=want_lanes, vram=vram, batch=batch)
                 results.append(r)
                 print(f"    {r['hps']:,.0f} H/s   plan {r['plan']}   "
-                      f"lanes {r['lanes']}   diff {r['difficulty']}   [{r['status']}]")
-                if r["difficulty"] and r["difficulty"] != net_diff:
-                    print(f"    ! network difficulty moved {net_diff} -> "
-                          f"{r['difficulty']} - not comparable with the rest")
+                      f"lanes {r['lanes']}   [{r['status']}]")
 
     valid = [r for r in results if r["status"] == "ok"]
     invalid = [r for r in results if r["status"] != "ok"]
