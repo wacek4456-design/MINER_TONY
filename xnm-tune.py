@@ -146,10 +146,41 @@ def measure(run_dir: Path, gpu: int, seconds: int, offline: bool = True) -> dict
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     env["XNM_GPU"] = str(gpu)
-    proc = subprocess.run(
-        [sys.executable, "main.py", "--no-dashboard", "--max-seconds", str(seconds)],
-        cwd=run_dir, env=env, capture_output=True, text=True, timeout=seconds + 180,
+
+    # The timelapse samples (our H/s source) are written from the dashboard
+    # refresh loop, so --no-dashboard produces no data at all. Run the miner
+    # exactly as production does: dashboard on, attached to a pty. Output is
+    # drained and thrown away.
+    import pty
+
+    master, slave = pty.openpty()
+    proc = subprocess.Popen(
+        [sys.executable, "main.py", "--max-seconds", str(seconds)],
+        cwd=str(run_dir), env=env,
+        stdout=slave, stderr=slave, stdin=slave, start_new_session=True,
     )
+    os.close(slave)
+
+    def drain() -> None:
+        try:
+            while os.read(master, 65536):
+                pass
+        except OSError:
+            pass
+
+    threading.Thread(target=drain, daemon=True).start()
+    try:
+        proc.wait(timeout=seconds + 180)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    try:
+        os.close(master)
+    except OSError:
+        pass
 
     samples: list[float] = []
     tl = data / "session_timelapse.jsonl"
@@ -197,7 +228,6 @@ def measure(run_dir: Path, gpu: int, seconds: int, offline: bool = True) -> dict
         "difficulty": int(diffs[-1]) if diffs else 0,
         "rc": proc.returncode,
         "status": status,
-        "tail": (proc.stdout or proc.stderr or "").strip().splitlines()[-1:] or [""],
     }
 
 
@@ -237,7 +267,9 @@ def main() -> int:
         sys.exit("ERROR: pass --wallet 0x...")
     set_ini(ini, "account", "address", wallet)
     set_ini(ini, "account", "worker", "xnminer-tune")
-    set_ini(ini, "monitoring", "dashboard_enabled", "false")
+    # Dashboard ON: it drives the refresh loop that writes the timelapse samples
+    # this benchmark measures. Its output goes to a pty and is discarded.
+    set_ini(ini, "monitoring", "dashboard_enabled", "true")
     set_ini(ini, "monitoring", "woodyminer_enabled", "false")
     set_ini(ini, "efficiency", "desktop_headroom_pct", "5")
     set_ini(ini, "cuda", "max_lanes", "16")
