@@ -26,6 +26,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -34,6 +35,47 @@ BASE = Path(os.environ.get("XNM_BASE", "/root/xnminer-base"))
 PLAN_RE = re.compile(r"lanes=(\d+)[x×]([\d,]+)|batch=([\d,]+)")
 DIFF_RE = re.compile(r"[Dd]ifficulty[= ](\d+)")
 POOL_DOWN_RE = re.compile(r"port 80 unreachable|Server unreachable")
+
+
+STUB_PORT = 8899
+
+
+def start_stub_pool(difficulty: int) -> None:
+    """Local stand-in for xenblocks.io.
+
+    Pointing the miner at a dead address does NOT work: it retries /difficulty
+    for 180s before falling back to the configured memory_cost, which eats most
+    of a run. This answers instantly, always with the same difficulty, and
+    swallows submissions so nothing reaches the real pool.
+    """
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    payload = json.dumps({"difficulty": str(difficulty)}).encode()
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def _reply(self, body: bytes) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self) -> None:
+            self._reply(payload)
+
+        def do_POST(self) -> None:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n:
+                self.rfile.read(n)
+            self._reply(b'{"status":"accepted"}')
+
+        def log_message(self, *args) -> None:
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", STUB_PORT), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
 
 
 def pool_up(base_url: str, timeout_s: float = 8.0) -> int | None:
@@ -213,7 +255,8 @@ def main() -> int:
     # forever, identical for every configuration. It submits nothing, which is
     # exactly right for a throughput measurement.
     net_diff = args.difficulty
-    set_ini(ini, "server", "base_url", "http://127.0.0.1:9")
+    start_stub_pool(net_diff)
+    set_ini(ini, "server", "base_url", f"http://127.0.0.1:{STUB_PORT}")
     set_ini(ini, "mining", "memory_cost", str(net_diff))
 
     print(f"\nGPU {args.gpu} · {total} configurations × {args.seconds}s ≈ {mins:.0f} min")
