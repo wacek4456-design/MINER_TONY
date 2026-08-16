@@ -35,9 +35,18 @@ if ! command -v python3 >/dev/null 2>&1 || ! command -v cmake >/dev/null 2>&1 \
 fi
 
 # --- 2. how many cards -----------------------------------------------------
-GPUS="$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l)"
-[ "${GPUS:-0}" -ge 1 ] || die "nvidia-smi reports no GPUs"
-log "Detected ${GPUS} GPU(s)"
+# One miner per card, however many are present. Capped so a huge host cannot
+# spawn more windows than tmux digit shortcuts can reach.
+MAX_GPUS="${XNM_MAX_GPUS:-8}"
+DETECTED="$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l)"
+[ "${DETECTED:-0}" -ge 1 ] || die "nvidia-smi reports no GPUs"
+GPUS="$DETECTED"
+if [ "$GPUS" -gt "$MAX_GPUS" ]; then
+  GPUS="$MAX_GPUS"
+  log "Detected ${DETECTED} GPUs - mining on the first ${GPUS} (raise with XNM_MAX_GPUS)"
+else
+  log "Detected ${GPUS} GPU(s) - mining on all of them"
+fi
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 
 # --- 3. source -------------------------------------------------------------
@@ -185,7 +194,9 @@ import json
 import os
 import re
 import sys
+import threading
 import time
+import urllib.request
 from datetime import date
 from pathlib import Path
 
@@ -275,6 +286,44 @@ def nvml_live(index: int) -> dict:
         return {}
 
 
+# --- pool side ------------------------------------------------------------
+# The pool exposes /difficulty and /verify and nothing else - there is no
+# global-hashrate endpoint, and XenBlocks "difficulty" is the Argon2
+# memory_cost, so a network H/s cannot be derived from it either. We show the
+# live network difficulty instead, which is a real chain-wide number.
+NET = {"difficulty": None, "latency_ms": None, "ok": False, "checked": 0.0}
+NET_POLL_S = 30.0
+
+
+def poll_network(base_url: str) -> None:
+    url = base_url.rstrip("/") + "/difficulty"
+    while True:
+        t0 = time.perf_counter()
+        try:
+            with urllib.request.urlopen(url, timeout=8) as resp:
+                data = json.loads(resp.read().decode("utf-8", errors="replace"))
+            NET.update(
+                difficulty=int(data.get("difficulty", data.get("diff", 0))) or None,
+                latency_ms=(time.perf_counter() - t0) * 1000,
+                ok=True,
+            )
+        except Exception:
+            NET.update(ok=False, latency_ms=None)
+        NET["checked"] = time.time()
+        time.sleep(NET_POLL_S)
+
+
+def ini_value(path: Path, key: str, default: str = "") -> str:
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped.startswith(key) and "=" in stripped:
+                return stripped.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return default
+
+
 def wallet_of(path: Path) -> str:
     try:
         for line in path.read_text(encoding="utf-8").splitlines():
@@ -286,11 +335,24 @@ def wallet_of(path: Path) -> str:
 
 
 def hps_fmt(v: float) -> str:
+    """Compact - the column header already says H/s."""
     if v >= 1_000_000:
-        return f"{v / 1_000_000:.2f} MH/s"
+        return f"{v / 1_000_000:.2f}M"
     if v >= 1000:
-        return f"{v / 1000:.1f} kH/s"
-    return f"{v:.0f} H/s"
+        return f"{v / 1000:.1f}k"
+    return f"{v:.0f}"
+
+
+def dur(seconds: float) -> str:
+    s = int(max(0, seconds))
+    d, rem = divmod(s, 86400)
+    h, rem = divmod(rem, 3600)
+    m, _ = divmod(rem, 60)
+    if d:
+        return f"{d}d{h:02d}h"
+    if h:
+        return f"{h}h{m:02d}m"
+    return f"{m}m"
 
 
 def build(dirs: list[str]) -> Group:
@@ -298,6 +360,7 @@ def build(dirs: list[str]) -> Group:
     table = Table(expand=True, header_style="bold cyan", border_style="grey37")
     table.add_column("GPU", justify="right", no_wrap=True)
     table.add_column("Card", no_wrap=True)
+    table.add_column("Up", justify="right", no_wrap=True)
     table.add_column("H/s", justify="right")
     table.add_column("Util", justify="right")
     table.add_column("Temp", justify="right")
@@ -312,6 +375,7 @@ def build(dirs: list[str]) -> Group:
     tot_power = 0.0
     tot = {k: 0 for k in KINDS}
     live_count = 0
+    longest_up = 0.0
     wallet = ""
 
     for d in dirs:
@@ -342,14 +406,21 @@ def build(dirs: list[str]) -> Group:
             net = Text("offline", style="bold red")
 
         temp = nv.get("temp", sample.get("temp_c", 0))
+        # elapsed_s counts from that miner's own session start; add the age of
+        # the last sample so the clock keeps ticking between 30 s writes.
+        up = float(sample.get("elapsed_s") or 0) + (age if fresh else 0)
+        longest_up = max(longest_up, up if sample else 0)
+
         table.add_row(
             str(idx),
             nv.get("name", "?"),
+            dur(up) if sample else Text("—", style="grey50"),
             hps_fmt(hps) if fresh else Text("—", style="grey50"),
             f"{nv['util']}%" if "util" in nv else "—",
             Text(f"{temp}°C", style="bold red" if temp and temp >= 80 else ""),
-            f"{nv['power']:.0f} W" if "power" in nv else "—",
-            f"{nv['vram_used']}/{nv['vram_total']}" if "vram_total" in nv else "—",
+            f"{nv['power']:.0f}W" if "power" in nv else "—",
+            (f"{nv['vram_used'] / 1024:.1f}/{nv['vram_total'] / 1024:.0f}G"
+             if "vram_total" in nv else "—"),
             str(blocks["XNM"]),
             str(blocks["XUNI"]),
             str(blocks["XBLK"]),
@@ -360,9 +431,10 @@ def build(dirs: list[str]) -> Group:
     table.add_row(
         Text("ALL", style="bold"),
         Text(f"{live_count}/{len(dirs)} mining", style="bold"),
+        Text(dur(longest_up), style="bold"),
         Text(hps_fmt(tot_hps), style="bold cyan"),
         "", "",
-        Text(f"{tot_power:.0f} W", style="bold") if tot_power else "",
+        Text(f"{tot_power:.0f}W", style="bold") if tot_power else "",
         "",
         Text(str(tot["XNM"]), style="bold green"),
         Text(str(tot["XUNI"]), style="bold yellow"),
@@ -374,15 +446,31 @@ def build(dirs: list[str]) -> Group:
         f"{blocks_to_tokens(k, tot[k]):g} {k}" for k in KINDS if tot[k]
     ) or "no accepted blocks yet today"
 
+    if NET["ok"] and NET["difficulty"]:
+        net_bit = (f"network diff {NET['difficulty']:,}"
+                   f" ({NET['latency_ms']:.0f}ms)", "bold magenta")
+    elif NET["checked"]:
+        net_bit = ("pool unreachable", "bold red")
+    else:
+        net_bit = ("network …", "grey50")
+
     head = Text.assemble(
         ("XenBlocks · all GPUs", "bold white"),
         ("   ", ""),
         (reward_era_label(), "cyan"),
+        ("   ", ""),
+        net_bit,
+        ("   ", ""),
+        (f"running {dur(longest_up)}" if longest_up else "starting up", "bold white"),
+        ("   ", ""),
+        (time.strftime("%H:%M:%S"), "grey50"),
     )
     foot = Text.assemble(
         ("Today (accepted): ", "bold"), (tokens, "bold white"),
         ("\nwallet ", "grey50"), (wallet or "?", "grey50"),
-        ("   ·   blocks counted per mining day (1am boundary) · H/s sampled every 30s", "grey50"),
+        ("   ·   blocks per mining day (1am boundary) · H/s sampled every 30s", "grey50"),
+        ("\nPool publishes difficulty only — it exposes no network hashrate, and Argon2 "
+         "memory-cost difficulty cannot be converted into one.", "grey50"),
         ("\nCtrl+B then 0-9 switches card · Ctrl+C closes this view only", "grey50"),
     )
     return Group(head, table, foot)
@@ -390,6 +478,13 @@ def build(dirs: list[str]) -> Group:
 
 def main() -> int:
     pattern = sys.argv[1] if len(sys.argv) > 1 else "/root/xnminer-gpu*"
+
+    found = sorted(d for d in globmod.glob(pattern) if os.path.isdir(d))
+    base_url = "http://xenblocks.io"
+    if found:
+        base_url = ini_value(Path(found[0]) / "miner.ini", "base_url", base_url)
+    threading.Thread(target=poll_network, args=(base_url,), daemon=True).start()
+
     if pynvml is not None:
         try:
             pynvml.nvmlInit()
@@ -445,11 +540,12 @@ echo "  detach:       Ctrl+B then D"
 echo "  re-attach:    tmux attach -t ${SESSION}"
 echo
 
+sleep 2
 if [ -n "${TMUX:-}" ]; then
-  echo "Already inside tmux - jump across with:  tmux switch-client -t ${SESSION}"
+  # Already in another tmux session - hop across instead of nesting.
+  exec tmux switch-client -t "${SESSION}:all"
 elif [ -t 1 ]; then
-  sleep 2
-  exec tmux attach -t "$SESSION"
+  exec tmux attach -t "${SESSION}:all"
 else
   echo "Started headless. Attach later with: tmux attach -t ${SESSION}"
 fi
