@@ -165,6 +165,10 @@ for i in $(seq 0 $((GPUS - 1))); do
     rm -rf "$DIR/data" "$DIR/native/XenblocksMiner-main"
   fi
   cd "$DIR"
+  # A killed tmux server (or a dead instance) leaves data/miner.lock behind and
+  # the next miner refuses to start with "Another miner instance is already
+  # running". Nothing else holds it at this point, so clear it every time.
+  rm -f "$DIR/data/miner.lock"
   [ -f miner.ini ] || cp miner.ini.example miner.ini
   sed -i "s|^address =.*|address = ${WALLET}|" miner.ini
   sed -i "s|^worker =.*|worker = xnminer-gpu${i}|" miner.ini
