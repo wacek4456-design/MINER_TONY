@@ -272,9 +272,11 @@ def main() -> int:
     set_ini(ini, "monitoring", "dashboard_enabled", "true")
     set_ini(ini, "monitoring", "woodyminer_enabled", "false")
     set_ini(ini, "efficiency", "desktop_headroom_pct", "5")
-    set_ini(ini, "cuda", "max_lanes", "16")
-
     lanes = [int(x) for x in args.lanes.split(",") if x.strip()]
+    # Never let max_lanes silently cap a configuration we asked to measure -
+    # that would report a lower lane count as if it were the tested one.
+    set_ini(ini, "cuda", "max_lanes", str(max(lanes)))
+
     vrams = [float(x) for x in args.vram.split(",") if x.strip()]
     batches = [int(x) for x in args.batches.split(",") if x.strip()]
     total = len(lanes) * len(vrams) * len(batches)
@@ -343,7 +345,7 @@ def main() -> int:
         print(f"\nBest: {b['label']}  ->  {b['hps']:,.0f} H/s")
         print("Apply to every card by editing /root/xnminer-gpu*/miner.ini:")
         print(f"  [cuda] vram_reference_difficulty = {net_diff * b['want_lanes']}")
-        print(f"  [cuda] max_lanes = 16")
+        print(f"  [cuda] max_lanes = {max(lanes)}")
         print(f"  [cuda] max_batch_size = {b['batch']}")
         print(f"  [efficiency] target_vram_pct = {b['vram']}")
         print("  [efficiency] desktop_headroom_pct = 5")
