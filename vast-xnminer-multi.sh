@@ -353,6 +353,17 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n) if n else b""
+
+        # Fail fast while port 80 is down. Otherwise every queued block costs the
+        # miner a full connect timeout, and because /difficulty still answers it
+        # believes the network is up and keeps retrying instead of hashing -
+        # which starves mining far worse than the outage itself.
+        with _lock:
+            pool_alive = _state["source"] == "pool"
+        if not pool_alive:
+            self._send(503, b'{"error":"pool offline (port 80) - queue it"}')
+            return
+
         req = urllib.request.Request(
             POOL + self.path, data=body, method="POST",
             headers={"Content-Type": "application/json"},
