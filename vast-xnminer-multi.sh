@@ -641,8 +641,10 @@ def build(dirs: list[str]) -> Group:
     ) or "no accepted blocks yet today"
 
     if NET["ok"] and NET["difficulty"]:
+        # Celadon - readable on black without colliding with the greens used for
+        # XNM counts or the "online" state.
         net_bit = (f"network diff {NET['difficulty']:,}"
-                   f" ({NET['latency_ms']:.0f}ms)", "bold magenta")
+                   f" ({NET['latency_ms']:.0f}ms)", "bold #ACE1AF")
     elif NET["checked"]:
         net_bit = ("pool unreachable", "bold red")
     else:
