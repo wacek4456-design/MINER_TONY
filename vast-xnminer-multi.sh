@@ -28,6 +28,11 @@ MAX_TEMP="${XNM_MAX_TEMP:-82}"
 # would silently collapse the lane count to 1.
 MAX_LANES="${XNM_MAX_LANES:-8}"
 LANE_REF="${XNM_LANE_REF:-800}"
+# Stock 69.09 measured best at difficulty 1100 (92% was 4% slower). At
+# difficulty 100 the bottleneck moves to the single Python thread feeding the
+# card, where a bigger batch means fewer round trips - untested, so it stays an
+# override rather than a default:  XNM_VRAM_PCT=92 ./vast-xnminer-multi.sh 0x...
+VRAM_PCT="${XNM_VRAM_PCT:-69.09}"
 # Local difficulty proxy. xenblocks.io drops port 80 for long stretches; the
 # miner then falls back to memory_cost and mines at the wrong difficulty - every
 # block it finds is held "until difficulty matches", and at m=1100 while the
@@ -211,6 +216,7 @@ for i in $(seq 0 $((GPUS - 1))); do
   sed -i "s|^warn_gpu_temp_c.*|warn_gpu_temp_c = ${WARN_TEMP}|" miner.ini
   sed -i "s|^max_gpu_temp_c.*|max_gpu_temp_c = ${MAX_TEMP}|" miner.ini
   sed -i "s|^max_lanes.*|max_lanes = ${MAX_LANES}|" miner.ini
+  sed -i "s|^target_vram_pct.*|target_vram_pct = ${VRAM_PCT}|" miner.ini
   sed -i "s|^base_url =.*|base_url = http://127.0.0.1:${DIFF_PORT}|" miner.ini
   if grep -q "^vram_reference_difficulty" miner.ini; then
     sed -i "s|^vram_reference_difficulty.*|vram_reference_difficulty = ${LANE_REF}|" miner.ini
