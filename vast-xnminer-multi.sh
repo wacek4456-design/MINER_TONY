@@ -18,13 +18,16 @@ SESSION="xnm"
 WARN_TEMP="${XNM_WARN_TEMP:-78}"
 MAX_TEMP="${XNM_MAX_TEMP:-82}"
 # Measured on an RTX 3090, 2026-08-17. Lanes = vram_reference_difficulty //
-# difficulty, capped here. With the stock reference (= memory_cost = 1100) this
-# yields 1 lane at network difficulty 1100 and 8 at difficulty 100 - both the
-# measured optimum. The network only ever sits at one of those two values.
+# difficulty, capped by max_lanes. Reference 800 gives 1 lane at difficulty 1100
+# and 8 lanes at difficulty 100 - the measured optimum at both, and the network
+# only ever sits at one of those two values.
 #   difficulty 100 : 4 lanes 912k | 8 lanes 1,087k | 16 lanes 1,068k | auto 1,010k
 #   difficulty 1100: every lane/VRAM combination lands within 9% of stock, and
 #                    stock wins - so nothing else here is worth overriding.
+# Set explicitly: the built-in default is memory_cost, so editing memory_cost
+# would silently collapse the lane count to 1.
 MAX_LANES="${XNM_MAX_LANES:-8}"
+LANE_REF="${XNM_LANE_REF:-800}"
 # Local difficulty proxy. xenblocks.io drops port 80 for long stretches; the
 # miner then falls back to memory_cost and mines at the wrong difficulty - every
 # block it finds is held "until difficulty matches", and at m=1100 while the
@@ -209,6 +212,11 @@ for i in $(seq 0 $((GPUS - 1))); do
   sed -i "s|^max_gpu_temp_c.*|max_gpu_temp_c = ${MAX_TEMP}|" miner.ini
   sed -i "s|^max_lanes.*|max_lanes = ${MAX_LANES}|" miner.ini
   sed -i "s|^base_url =.*|base_url = http://127.0.0.1:${DIFF_PORT}|" miner.ini
+  if grep -q "^vram_reference_difficulty" miner.ini; then
+    sed -i "s|^vram_reference_difficulty.*|vram_reference_difficulty = ${LANE_REF}|" miner.ini
+  else
+    sed -i "s|^\[cuda\]|[cuda]\nvram_reference_difficulty = ${LANE_REF}|" miner.ini
+  fi
   echo "  GPU${i} -> ${DIR}"
   cd "$BASE"
 done
@@ -261,12 +269,8 @@ def _fetch(url: str, timeout: float) -> bytes:
         return resp.read()
 
 
-def current_difficulty() -> tuple[int | None, str]:
-    """Live difficulty, preferring the pool, falling back to HTTPS."""
-    with _lock:
-        if _state["difficulty"] and time.time() - _state["at"] < CACHE_S:
-            return _state["difficulty"], _state["source"]
-
+def refresh() -> tuple[int | None, str]:
+    """Fetch the difficulty: the pool first, HTTPS leaderboard as fallback."""
     diff, source = None, "none"
     try:                                    # 1. the real pool, port 80
         data = json.loads(_fetch(f"{POOL}/difficulty", 4).decode("utf-8", "replace"))
@@ -289,6 +293,29 @@ def current_difficulty() -> tuple[int | None, str]:
 
     with _lock:                             # 3. last known value beats nothing
         return _state["difficulty"], "stale"
+
+
+def current_difficulty() -> tuple[int | None, str]:
+    """Cached value, never blocking.
+
+    The miner gives /difficulty only network_poll_timeout_s (3s by default)
+    before declaring the network down. Probing the dead pool takes longer than
+    that on its own, so the HTTP handler must never wait on the network: a
+    background thread keeps the value fresh and requests are served from it.
+    """
+    with _lock:
+        if _state["difficulty"]:
+            return _state["difficulty"], _state["source"]
+    return refresh()                        # first call only
+
+
+def _refresher() -> None:
+    while True:
+        try:
+            refresh()
+        except Exception:
+            pass
+        time.sleep(CACHE_S)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -352,6 +379,7 @@ def main() -> int:
         return 0 if diff else 1
 
     diff, source = current_difficulty()
+    threading.Thread(target=_refresher, daemon=True).start()
     print(f"[diffproxy] listening on 127.0.0.1:{args.port} "
           f"(difficulty {diff} via {source})", flush=True)
     ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
