@@ -25,6 +25,12 @@ MAX_TEMP="${XNM_MAX_TEMP:-82}"
 #   difficulty 1100: every lane/VRAM combination lands within 9% of stock, and
 #                    stock wins - so nothing else here is worth overriding.
 MAX_LANES="${XNM_MAX_LANES:-8}"
+# Local difficulty proxy. xenblocks.io drops port 80 for long stretches; the
+# miner then falls back to memory_cost and mines at the wrong difficulty - every
+# block it finds is held "until difficulty matches", and at m=1100 while the
+# network is at m=100 it also runs ~6x slower. The same domain still serves the
+# live difficulty over HTTPS at /v1/leaderboard, so proxy that.
+DIFF_PORT="${XNM_DIFF_PORT:-8899}"
 
 log() { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -143,7 +149,8 @@ edit("monitoring/woodyminer_stats.py", [
 #    but every lane rounds its own batch down, so a 2-lane plan misses the
 #    budget by ~3 MiB out of 20 GB and _plan_from_device raises
 #    "CUDA harvest plan under-filled VRAM cap". That single line is why every
-#    lanes>1 configuration died at startup - measured +21% once it is relaxed.
+#    lanes>1 configuration died at startup. Needed for max_lanes to mean
+#    anything at high difficulty; the win itself shows up at difficulty 100.
 edit("mining/vram_batch.py", [
     ("return abs(self.batch_vram_mib - self.budget_mib) <= tolerance_mib",
      "return abs(self.batch_vram_mib - self.budget_mib) <= max(tolerance_mib, self.lanes * 4)"),
@@ -201,9 +208,164 @@ for i in $(seq 0 $((GPUS - 1))); do
   sed -i "s|^warn_gpu_temp_c.*|warn_gpu_temp_c = ${WARN_TEMP}|" miner.ini
   sed -i "s|^max_gpu_temp_c.*|max_gpu_temp_c = ${MAX_TEMP}|" miner.ini
   sed -i "s|^max_lanes.*|max_lanes = ${MAX_LANES}|" miner.ini
+  sed -i "s|^base_url =.*|base_url = http://127.0.0.1:${DIFF_PORT}|" miner.ini
   echo "  GPU${i} -> ${DIR}"
   cd "$BASE"
 done
+
+# --- 7a. difficulty proxy ---------------------------------------------------
+log "Starting difficulty proxy on 127.0.0.1:${DIFF_PORT}"
+cat > "${BASE}/xnm-diffproxy.py" <<'PYDIFFEOF'
+#!/usr/bin/env python3
+"""Keep the miner on the network's real difficulty during pool outages.
+
+xenblocks.io drops plain HTTP (port 80) for long stretches. When that happens
+the miner cannot read /difficulty, falls back to [mining] memory_cost, and mines
+at the wrong difficulty - every block it finds is then held "until difficulty
+matches", and at m=1100 while the network is at m=100 it also runs ~6x slower.
+
+The same domain still answers over HTTPS: /v1/leaderboard carries the live
+difficulty. This proxy sits on 127.0.0.1 and serves the miner:
+
+  GET  /difficulty -> the pool if it answers, otherwise the HTTPS leaderboard
+  POST /verify     -> forwarded to the pool; on failure returns 503 so the
+                      miner queues the block exactly as it normally would
+
+Point the miner at it:  [server] base_url = http://127.0.0.1:8899
+
+  python3 xnm-diffproxy.py            # foreground
+  python3 xnm-diffproxy.py --port N   # different port
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+POOL = "http://xenblocks.io"
+FALLBACK = "https://xenblocks.io/v1/leaderboard"
+CACHE_S = 10.0
+
+_state = {"difficulty": None, "source": "none", "at": 0.0}
+_lock = threading.Lock()
+
+
+def _fetch(url: str, timeout: float) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": "xnm-diffproxy"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def current_difficulty() -> tuple[int | None, str]:
+    """Live difficulty, preferring the pool, falling back to HTTPS."""
+    with _lock:
+        if _state["difficulty"] and time.time() - _state["at"] < CACHE_S:
+            return _state["difficulty"], _state["source"]
+
+    diff, source = None, "none"
+    try:                                    # 1. the real pool, port 80
+        data = json.loads(_fetch(f"{POOL}/difficulty", 4).decode("utf-8", "replace"))
+        diff = int(data.get("difficulty", data.get("diff", 0))) or None
+        source = "pool"
+    except Exception:
+        try:                                # 2. HTTPS leaderboard, same domain
+            data = json.loads(_fetch(FALLBACK, 10).decode("utf-8", "replace"))
+            diff = int(data.get("difficulty", 0)) or None
+            source = "https-leaderboard"
+        except Exception:
+            pass
+
+    if diff:
+        with _lock:
+            if _state["source"] != source:
+                print(f"[diffproxy] difficulty {diff} via {source}", flush=True)
+            _state.update(difficulty=diff, source=source, at=time.time())
+        return diff, source
+
+    with _lock:                             # 3. last known value beats nothing
+        return _state["difficulty"], "stale"
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _send(self, code: int, body: bytes, ctype: str = "application/json") -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except BrokenPipeError:
+            pass
+
+    def do_GET(self) -> None:
+        if self.path.rstrip("/").endswith("difficulty"):
+            diff, _ = current_difficulty()
+            if diff:
+                self._send(200, json.dumps({"difficulty": str(diff)}).encode())
+            else:
+                self._send(503, b'{"error":"difficulty unavailable"}')
+            return
+        try:                                 # anything else: pass through
+            self._send(200, _fetch(POOL + self.path, 8))
+        except Exception as exc:
+            self._send(503, json.dumps({"error": str(exc)}).encode())
+
+    def do_POST(self) -> None:
+        n = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(n) if n else b""
+        req = urllib.request.Request(
+            POOL + self.path, data=body, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                self._send(resp.status, resp.read())
+        except urllib.error.HTTPError as exc:
+            # A real rejection from the pool - pass it through verbatim so the
+            # miner can tell "duplicate" from "difficulty mismatch".
+            self._send(exc.code, exc.read())
+        except Exception as exc:
+            # Pool unreachable: 503 makes the miner queue the block, its normal
+            # path for a network outage.
+            self._send(503, json.dumps({"error": str(exc)}).encode())
+
+    def log_message(self, *args) -> None:
+        pass
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, default=8899)
+    ap.add_argument("--once", action="store_true", help="print difficulty and exit")
+    args = ap.parse_args()
+
+    if args.once:
+        diff, source = current_difficulty()
+        print(f"difficulty={diff} source={source}")
+        return 0 if diff else 1
+
+    diff, source = current_difficulty()
+    print(f"[diffproxy] listening on 127.0.0.1:{args.port} "
+          f"(difficulty {diff} via {source})", flush=True)
+    ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PYDIFFEOF
+pkill -f xnm-diffproxy.py 2>/dev/null || true
+# Restart loop: if the miners lose this, they lose the real difficulty.
+nohup bash -c "while true; do python3 '${BASE}/xnm-diffproxy.py' --port ${DIFF_PORT}; sleep 5; done" \n  >> /root/xnm-diffproxy.log 2>&1 &
+sleep 2
+python3 "${BASE}/xnm-diffproxy.py" --once || log "WARNING: no difficulty source reachable yet"
 
 # --- 7b. aggregate view -----------------------------------------------------
 # Reads the same files the per-GPU dashboards write, so the numbers agree.
