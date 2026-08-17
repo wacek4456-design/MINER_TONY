@@ -17,6 +17,14 @@ SRC_TARBALL="https://github.com/badnob/xnminer-linux/archive/refs/heads/main.tar
 SESSION="xnm"
 WARN_TEMP="${XNM_WARN_TEMP:-78}"
 MAX_TEMP="${XNM_MAX_TEMP:-82}"
+# Measured on an RTX 3090, 2026-08-17. Lanes = vram_reference_difficulty //
+# difficulty, capped here. With the stock reference (= memory_cost = 1100) this
+# yields 1 lane at network difficulty 1100 and 8 at difficulty 100 - both the
+# measured optimum. The network only ever sits at one of those two values.
+#   difficulty 100 : 4 lanes 912k | 8 lanes 1,087k | 16 lanes 1,068k | auto 1,010k
+#   difficulty 1100: every lane/VRAM combination lands within 9% of stock, and
+#                    stock wins - so nothing else here is worth overriding.
+MAX_LANES="${XNM_MAX_LANES:-8}"
 
 log() { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -63,13 +71,15 @@ fi
 cd "$BASE"
 
 # --- 4. patches ------------------------------------------------------------
-log "Patching upstream (3 fixes)"
+log "Patching upstream (6 fixes)"
 python3 - <<'PYEOF'
 import pathlib, sys
 
 def edit(path, pairs, marker):
+    # Explicit utf-8: some sources carry non-ASCII characters and a container
+    # with a non-UTF-8 locale would otherwise fail to read them.
     p = pathlib.Path(path)
-    s = p.read_text()
+    s = p.read_text(encoding="utf-8")
     if marker in s:
         print(f"  {path}: already patched")
         return
@@ -77,7 +87,7 @@ def edit(path, pairs, marker):
         if old not in s:
             sys.exit(f"ERROR: pattern not found in {path}:\n  {old}")
         s = s.replace(old, new, 1)
-    p.write_text(s)
+    p.write_text(s, encoding="utf-8")
     print(f"  {path}: patched")
 
 # 1) verify_known_block() hashes the reference log0.txt key with OUR wallet as
@@ -128,6 +138,16 @@ edit("monitoring/woodyminer_stats.py", [
      '    import os as _os\n'
      '    device_info = f"{_os.environ.get(\'XNM_GPU\', device_index)},"'),
 ], "_os.environ.get")
+
+# 6) fills_budget() allows 2 MiB of slack no matter how many lanes there are,
+#    but every lane rounds its own batch down, so a 2-lane plan misses the
+#    budget by ~3 MiB out of 20 GB and _plan_from_device raises
+#    "CUDA harvest plan under-filled VRAM cap". That single line is why every
+#    lanes>1 configuration died at startup - measured +21% once it is relaxed.
+edit("mining/vram_batch.py", [
+    ("return abs(self.batch_vram_mib - self.budget_mib) <= tolerance_mib",
+     "return abs(self.batch_vram_mib - self.budget_mib) <= max(tolerance_mib, self.lanes * 4)"),
+], "self.lanes * 4")
 PYEOF
 
 # --- 5. python deps --------------------------------------------------------
@@ -180,6 +200,7 @@ for i in $(seq 0 $((GPUS - 1))); do
   # down instead of hashing. These are still well under the card's own limits.
   sed -i "s|^warn_gpu_temp_c.*|warn_gpu_temp_c = ${WARN_TEMP}|" miner.ini
   sed -i "s|^max_gpu_temp_c.*|max_gpu_temp_c = ${MAX_TEMP}|" miner.ini
+  sed -i "s|^max_lanes.*|max_lanes = ${MAX_LANES}|" miner.ini
   echo "  GPU${i} -> ${DIR}"
   cd "$BASE"
 done
