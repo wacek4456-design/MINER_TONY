@@ -39,6 +39,10 @@ VRAM_PCT="${XNM_VRAM_PCT:-69.09}"
 # network is at m=100 it also runs ~6x slower. The same domain still serves the
 # live difficulty over HTTPS at /v1/leaderboard, so proxy that.
 DIFF_PORT="${XNM_DIFF_PORT:-8899}"
+# Parallel CPU key generation (patch 7). 1 = upstream behaviour. Untested for
+# throughput, so it stays opt-in:  XNM_KEYGEN_THREADS=4 ./vast-xnminer-multi.sh
+# Changing it needs the engine rebuilt - delete native/build/bin/libxen_cuda.so.
+KEYGEN_THREADS="${XNM_KEYGEN_THREADS:-1}"
 
 log() { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -85,7 +89,7 @@ fi
 cd "$BASE"
 
 # --- 4. patches ------------------------------------------------------------
-log "Patching upstream (6 fixes)"
+log "Patching upstream (8 fixes)"
 python3 - <<'PYEOF'
 import pathlib, sys
 
@@ -163,6 +167,64 @@ edit("mining/vram_batch.py", [
     ("return abs(self.batch_vram_mib - self.budget_mib) <= tolerance_mib",
      "return abs(self.batch_vram_mib - self.budget_mib) <= max(tolerance_mib, self.lanes * 4)"),
 ], "self.lanes * 4")
+
+# 7) Keys are built on the CPU before the kernel can start - one std::string per
+#    attempt, single threaded. At difficulty 100 that is ~19k strings per lane,
+#    ~155k per card per round, while the GPU sits idle (measured 17-51% util).
+#    OFF by default; XNM_KEYGEN_THREADS=4 opts in. Each worker owns its
+#    generator and writes its own slice of a pre-sized vector - no locking.
+KEYGEN_OLD = """                RandomHexKeyGenerator key_generator(prefix, kHashApiKeyLength);
+                for (std::size_t i = 0; i < attempts; ++i) {
+                    password_storage_.push_back(key_generator.nextRandomKey());
+                }"""
+KEYGEN_NEW = """                unsigned kg_threads = 1;
+                if (const char* kg_env = std::getenv("XNM_KEYGEN_THREADS")) {
+                    const int parsed = std::atoi(kg_env);
+                    kg_threads = parsed > 1 ? static_cast<unsigned>(parsed) : 1u;
+                }
+                if (kg_threads > 1 && attempts >= 4096) {
+                    password_storage_.resize(attempts);
+                    std::vector<std::thread> kg_workers;
+                    kg_workers.reserve(kg_threads);
+                    const std::size_t kg_chunk = (attempts + kg_threads - 1) / kg_threads;
+                    for (unsigned kg_t = 0; kg_t < kg_threads; ++kg_t) {
+                        const std::size_t kg_begin = static_cast<std::size_t>(kg_t) * kg_chunk;
+                        if (kg_begin >= attempts) {
+                            break;
+                        }
+                        const std::size_t kg_end = std::min(attempts, kg_begin + kg_chunk);
+                        kg_workers.emplace_back([this, kg_begin, kg_end, &prefix]() {
+                            RandomHexKeyGenerator gen(prefix, kHashApiKeyLength);
+                            for (std::size_t i = kg_begin; i < kg_end; ++i) {
+                                password_storage_[i] = gen.nextRandomKey();
+                            }
+                        });
+                    }
+                    for (auto& kg_worker : kg_workers) {
+                        kg_worker.join();
+                    }
+                } else {
+                    RandomHexKeyGenerator key_generator(prefix, kHashApiKeyLength);
+                    for (std::size_t i = 0; i < attempts; ++i) {
+                        password_storage_.push_back(key_generator.nextRandomKey());
+                    }
+                }"""
+edit("native/XenblocksMiner-main/src/hashapi/CudaHashBackend.cpp", [
+    ('#include <algorithm>', '#include <algorithm>\n#include <cstdlib>'),
+    (KEYGEN_OLD, KEYGEN_NEW),
+], "XNM_KEYGEN_THREADS")
+
+# 8) The generator seeds from random_device ^ clock. Threads constructing it in
+#    the same instant could land on the same seed and produce identical keys -
+#    harmless for correctness (the pool verifies hash against key) but it would
+#    waste half the batch. Mix in the thread id.
+edit("native/XenblocksMiner-main/src/RandomHexKeyGenerator.h", [
+    ("#include <cctype>", "#include <cctype>\n#include <functional>\n#include <thread>"),
+    ("            generator.seed(seed);",
+     "            seed ^= static_cast<unsigned int>(\n"
+     "                std::hash<std::thread::id>{}(std::this_thread::get_id()));\n"
+     "            generator.seed(seed);"),
+], "std::thread::id")
 PYEOF
 
 # --- 5. python deps --------------------------------------------------------
@@ -761,7 +823,7 @@ fi
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 
 for i in $(seq 0 $((GPUS - 1))); do
-  CMD="cd /root/xnminer-gpu${i} && CUDA_VISIBLE_DEVICES=${i} XNM_GPU=${i} python3 main.py; exec bash"
+  CMD="cd /root/xnminer-gpu${i} && CUDA_VISIBLE_DEVICES=${i} XNM_GPU=${i} XNM_KEYGEN_THREADS=${KEYGEN_THREADS} python3 main.py; exec bash"
   if [ "$i" = "0" ]; then
     tmux new-session -d -s "$SESSION" -n "gpu0" "$CMD"
   else
