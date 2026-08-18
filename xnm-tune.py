@@ -37,10 +37,7 @@ DIFF_RE = re.compile(r"[Dd]ifficulty[= ](\d+)")
 POOL_DOWN_RE = re.compile(r"port 80 unreachable|Server unreachable")
 
 
-STUB_PORT = 8899
-
-
-def start_stub_pool(difficulty: int) -> None:
+def start_stub_pool(difficulty: int) -> int:
     """Local stand-in for xenblocks.io.
 
     Pointing the miner at a dead address does NOT work: it retries /difficulty
@@ -74,8 +71,12 @@ def start_stub_pool(difficulty: int) -> None:
         def log_message(self, *args) -> None:
             pass
 
-    srv = ThreadingHTTPServer(("127.0.0.1", STUB_PORT), Handler)
+    # Port 0 = let the OS pick a free one. The bootstrap already runs the
+    # difficulty proxy on a fixed port, and a hardcoded port here collided
+    # with it ("Address already in use").
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return int(srv.server_address[1])
 
 
 def pool_up(base_url: str, timeout_s: float = 8.0) -> int | None:
@@ -289,8 +290,8 @@ def main() -> int:
     # forever, identical for every configuration. It submits nothing, which is
     # exactly right for a throughput measurement.
     net_diff = args.difficulty
-    start_stub_pool(net_diff)
-    set_ini(ini, "server", "base_url", f"http://127.0.0.1:{STUB_PORT}")
+    stub_port = start_stub_pool(net_diff)
+    set_ini(ini, "server", "base_url", f"http://127.0.0.1:{stub_port}")
     set_ini(ini, "mining", "memory_cost", str(net_diff))
 
     print(f"\nGPU {args.gpu} · {total} configurations × {args.seconds}s ≈ {mins:.0f} min")
@@ -339,7 +340,14 @@ def main() -> int:
         print(f"{'—':>12}  {'—':>8}  {'—':>5}  {r['status']:>14}  {r['label']}")
     print("=" * 84)
     if invalid:
-        print(f"{len(invalid)} run(s) discarded - the pool was down, not the settings.")
+        print(f"{len(invalid)} run(s) produced no samples and were discarded.")
+        if all(r["lanes"] <= 1 for r in invalid) and any(r["want_lanes"] > 1 for r in invalid):
+            print("  Every one of them fell back to a single lane. That is the")
+            print("  fills_budget() tolerance bug - apply the vram_batch.py patch:")
+            print("    sed -i 's/<= tolerance_mib$/<= max(tolerance_mib, self.lanes * 4)/' \\")
+            print("      mining/vram_batch.py")
+            print("  (bites at high difficulty only: a 1.1MB/hash granularity")
+            print("   overshoots the 2MiB tolerance once the budget is split.)")
     if valid:
         b = valid[0]
         print(f"\nBest: {b['label']}  ->  {b['hps']:,.0f} H/s")
