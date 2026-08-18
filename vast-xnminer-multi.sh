@@ -39,9 +39,11 @@ VRAM_PCT="${XNM_VRAM_PCT:-69.09}"
 # network is at m=100 it also runs ~6x slower. The same domain still serves the
 # live difficulty over HTTPS at /v1/leaderboard, so proxy that.
 DIFF_PORT="${XNM_DIFF_PORT:-8899}"
-# Parallel CPU key generation (patch 7). 1 = upstream behaviour. Untested for
-# throughput, so it stays opt-in:  XNM_KEYGEN_THREADS=4 ./vast-xnminer-multi.sh
-# Changing it needs the engine rebuilt - delete native/build/bin/libxen_cuda.so.
+# Parallel CPU key generation (patch 7). MEASURED AND REJECTED, 2026-08-18:
+# one A5000 at difficulty 100, 8 lanes -> 518,679 H/s with 1 thread vs
+# 289,666 H/s with 4 (-44%). Spawning and joining threads on every batch costs
+# more than the keygen it saves. Leave at 1; the code path stays only so the
+# result is reproducible.
 KEYGEN_THREADS="${XNM_KEYGEN_THREADS:-1}"
 
 log() { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
@@ -171,8 +173,9 @@ edit("mining/vram_batch.py", [
 # 7) Keys are built on the CPU before the kernel can start - one std::string per
 #    attempt, single threaded. At difficulty 100 that is ~19k strings per lane,
 #    ~155k per card per round, while the GPU sits idle (measured 17-51% util).
-#    OFF by default; XNM_KEYGEN_THREADS=4 opts in. Each worker owns its
-#    generator and writes its own slice of a pre-sized vector - no locking.
+#    OFF by default and it should stay off: measured -44% at difficulty 100
+#    (518,679 -> 289,666 H/s on one A5000). Kept so the experiment is
+#    reproducible, not because it helps.
 KEYGEN_OLD = """                RandomHexKeyGenerator key_generator(prefix, kHashApiKeyLength);
                 for (std::size_t i = 0; i < attempts; ++i) {
                     password_storage_.push_back(key_generator.nextRandomKey());
