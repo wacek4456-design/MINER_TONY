@@ -73,6 +73,86 @@ fi
 cd "$BASE"
 chmod +x ./*.sh
 
+# --- 3b. XBLK before XNM ----------------------------------------------------
+# Upstream flushes XNM > XBLK > XUNI, and list_flush_batch reads the queue from
+# the head and stops at the wave cap (64 live, 128 fetched). A few XBLK sitting
+# behind thousands of XNM therefore never enter a wave at all. This flips the
+# priority AND buckets the selection by it, so XBLK go out in the first wave of
+# an m= window. Set XNM_XBLK_FIRST=0 to build stock upstream instead.
+if [ "${XNM_XBLK_FIRST:-1}" = "1" ]; then
+  cat > /root/xblk-first.py <<'XBLKEOF'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".")
+
+def swap(rel, old, new):
+    p = root / rel
+    s = p.read_text(encoding="utf-8")
+    if "XBLK_FIRST_PATCH" in s:
+        print("already patched:", rel); return
+    if s.count(old) != 1:
+        raise SystemExit("no unique match in %s (found %d)" % (rel, s.count(old)))
+    p.write_text(s.replace(old, new, 1), encoding="utf-8", newline="\n")
+    print("patched:", rel)
+
+swap("src/queue/policy.cpp", """    // Priority: XNM > XBLK > XUNI (lower = flush sooner).
+    if (kind == "XNM" || kind == "XEN11" || kind == "NORMAL") return 0;
+    if (kind == "XBLK") return 1;
+    if (kind == "XUNI") return 2;""", """    // XBLK_FIRST_PATCH - priority: XBLK > XNM > XUNI (lower = flush sooner).
+    if (kind == "XBLK") return 0;
+    if (kind == "XNM" || kind == "XEN11" || kind == "NORMAL") return 1;
+    if (kind == "XUNI") return 2;""")
+
+swap("src/queue/store.cpp", """    std::vector<PendingBlock> preferred;
+    std::vector<PendingBlock> wrapped;
+    preferred.reserve(static_cast<size_t>(std::max(cap, 0)));
+    wrapped.reserve(static_cast<size_t>(std::max(cap, 0)));""", """    std::vector<PendingBlock> preferred;
+    preferred.reserve(static_cast<size_t>(std::max(cap, 0)));""")
+
+swap("src/queue/store.cpp", """    for (const auto& pb : pending_) {
+        if (skip_before_id > 0 && pb.id < skip_before_id) take(wrapped, pb);
+        else take(preferred, pb);
+        if (static_cast<int>(preferred.size()) >= cap) break;
+    }
+    if (static_cast<int>(preferred.size()) < cap) {
+        for (auto& pb : wrapped) {
+            preferred.push_back(std::move(pb));
+            if (static_cast<int>(preferred.size()) >= cap) break;
+        }
+    }""", """    // XBLK_FIRST_PATCH - bucket the whole queue by flush_priority instead of
+    // reading pending_ head-first. Upstream stopped at cap, so a few XBLK behind
+    // thousands of XNM never entered a wave at all. Within a class the not-yet-
+    // tried still go before the rotated-past (skip_before_id) ones.
+    constexpr int kClasses = 4;
+    std::vector<PendingBlock> fresh[kClasses];
+    std::vector<PendingBlock> rotated[kClasses];
+    for (const auto& pb : pending_) {
+        int cls = flush_priority(pb.hit.block_type);
+        if (cls < 0 || cls >= kClasses) cls = kClasses - 1;
+        if (skip_before_id > 0 && pb.id < skip_before_id) take(rotated[cls], pb);
+        else take(fresh[cls], pb);
+    }
+    for (int cls = 0; cls < kClasses && static_cast<int>(preferred.size()) < cap; ++cls) {
+        for (auto& pb : fresh[cls]) {
+            if (static_cast<int>(preferred.size()) >= cap) break;
+            preferred.push_back(std::move(pb));
+        }
+        for (auto& pb : rotated[cls]) {
+            if (static_cast<int>(preferred.size()) >= cap) break;
+            preferred.push_back(std::move(pb));
+        }
+    }""")
+XBLKEOF
+  # Fail loud: if upstream ever renames these blocks the patch must not silently
+  # no-op into a stock build that still sends XNM first.
+  XBLK_OUT="$(python3 /root/xblk-first.py "$BASE" 2>&1)"     || die "XBLK-first patch failed (upstream source changed?): ${XBLK_OUT} - re-run with XNM_XBLK_FIRST=0 to build stock"
+  if printf '%s' "$XBLK_OUT" | grep -q "^patched:"; then
+    log "XBLK-first: source patched - forcing rebuild"
+    rm -f "$BASE/build/bin/xnminer"
+  else
+    log "XBLK-first: already applied"
+  fi
+fi
+
 # build.sh reads the real compute_cap from nvidia-smi itself, so no override.
 if [ ! -x "$BASE/build/bin/xnminer" ]; then
   log "Building (one-off, a few minutes)"
