@@ -16,6 +16,7 @@
 #   XNM_MAX_GPUS=8      cap on cards used
 #   XNM_VRAM_PCT=79.0   VRAM cap per card
 #   XNM_LANES=8         CUDA lanes per card
+#   XNM_DRAIN_PAR=128   parallel /verify workers while draining the queue
 #   XNM_REPO=<url>      source repository
 set -euo pipefail
 
@@ -26,6 +27,15 @@ SESSION="xnm"
 MAX_GPUS="${XNM_MAX_GPUS:-8}"
 VRAM_PCT="${XNM_VRAM_PCT:-79.0}"
 LANES="${XNM_LANES:-8}"
+# Measured 2026-08-23 on 4x RTX 3090: a drain round is gated by its slowest
+# member and every round hit the full 6s submit timeout, so round time is
+# effectively fixed - doubling the round doubles throughput for free. Stock
+# auto-pick caps at 64 (min(64, threads*4)). At 4x64 concurrent the pool
+# dropped only 8% of connections, so there was headroom.
+# Back off to 64 if the log starts showing a big "dropped" count or
+# "/verify hold HTTP 429" - that is the pool rate-limiting, and more
+# parallelism then makes it strictly worse.
+DRAIN_PAR="${XNM_DRAIN_PAR:-128}"
 
 log() { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -333,6 +343,7 @@ for i in $(seq 0 $((GPUS - 1))); do
   sed -i "s|^device_id =.*|device_id = ${i}|"                  miner.ini
   sed -i "s|^target_vram_pct =.*|target_vram_pct = ${VRAM_PCT}|" miner.ini
   sed -i "s|^max_lanes =.*|max_lanes = ${LANES}|"              miner.ini
+  sed -i "s|^match_drain_parallel =.*|match_drain_parallel = ${DRAIN_PAR}|" miner.ini
   sed -i "s|^woodyminer_custom_name =.*|woodyminer_custom_name = xnm-gpu${i}|" miner.ini
   echo "  GPU${i} -> ${DIR}"
   cd "$BASE"
