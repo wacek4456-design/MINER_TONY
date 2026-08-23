@@ -102,6 +102,11 @@ chmod +x ./*.sh
 # 4. "already exists" no longer counts as a mined block. It still leaves the
 #    queue (right), but retries made the daily XNM/XBLK totals run far past what
 #    the pool credits - 152 XBLK claimed in a day vs 93 superblocks all time.
+# 5. ROOT CAUSE of "the queue never goes down": load() re-read the append-only
+#    queue.jsonl on EVERY start, not just after a corrupt db, and deduped only
+#    against what is pending now - so every restart resurrected every block
+#    already submitted. Measured: a card flushed 2981 blocks, then resumed with
+#    MORE than it started with, and the next wave was 100% "already exists".
 # Set XNM_XBLK_FIRST=0 to build stock upstream instead.
 if [ "${XNM_XBLK_FIRST:-1}" = "1" ]; then
   cat > /root/xnm-patches.py <<'XBLKEOF'
@@ -301,6 +306,35 @@ swap("src/app/supervisor.cpp", "DUPLICATE_COUNT_LIVE", """        metrics_->reco
                                  hit.memory_cost.value_or(mining_difficulty()));
         }
         return;""")
+
+# --- 5. restart must not resurrect already-submitted blocks ------------------
+swap("src/queue/store.cpp", "JSONL_RECOVER_PATCH", """void BlockStore::recover_jsonl_unlocked() {
+    std::ifstream in(jsonl_path_);
+    if (!in) return;
+    bool added = false;""", """void BlockStore::recover_jsonl_unlocked() {
+    // JSONL_RECOVER_PATCH - queue.jsonl is append-only and never trimmed, and
+    // load() called this on EVERY start, not only after a corrupt db. Dedup is
+    // against hash_index_, which knows only what is pending NOW - so every block
+    // already submitted was re-added. A restart therefore undid every flush, and
+    // the next wave came back "already exists" for 100% of the batch, while the
+    // queue never net-drained. Measured: one card flushed 2981 blocks between
+    // 18:45 and 18:53, then resumed at 5787 - higher than the 5749 it started at.
+    // Fix: anything with an id below the db's next_id was already known when the
+    // db was written. If it is not pending now, it was submitted and must stay
+    // gone. Records newer than that really are unsaved, so they still recover -
+    // and on a corrupt db next_id_ is still 1, so full recovery is preserved.
+    const int64_t min_id = next_id_;
+    std::ifstream in(jsonl_path_);
+    if (!in) return;
+    bool added = false;""")
+
+swap("src/queue/store.cpp", "JSONL_RECOVER_SKIP", """        BlockHit hit = hit_from_json(rec);
+        if (hit.hash_str.empty() || hash_index_.count(hit.hash_str)) continue;
+        PendingBlock pb;""", """        const int64_t rec_id = rec.value("id", static_cast<int64_t>(0));
+        if (rec_id > 0 && rec_id < min_id) continue;   // JSONL_RECOVER_SKIP
+        BlockHit hit = hit_from_json(rec);
+        if (hit.hash_str.empty() || hash_index_.count(hit.hash_str)) continue;
+        PendingBlock pb;""")
 XBLKEOF
   # Fail loud: if upstream ever renames these blocks the patch must not silently
   # no-op into a stock build that still sends XNM first.
