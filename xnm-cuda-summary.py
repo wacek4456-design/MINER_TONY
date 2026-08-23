@@ -32,7 +32,7 @@ POOL_DIFF = "http://xenblocks.io/difficulty"
 POOL_HTTPS = "https://xenblocks.io/v1/leaderboard"
 
 C = {
-    "off": "\033[0m", "dim": "\033[90m", "b": "\033[1m",
+    "off": "\033[0m", "dim": "\033[38;2;170;170;170m", "b": "\033[1m",
     "cyan": "\033[96m", "green": "\033[92m", "yellow": "\033[93m",
     "red": "\033[91m", "white": "\033[97m", "celadon": "\033[38;2;172;225;175m",
 }
