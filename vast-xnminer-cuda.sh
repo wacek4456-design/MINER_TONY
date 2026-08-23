@@ -73,28 +73,34 @@ fi
 cd "$BASE"
 chmod +x ./*.sh
 
-# --- 3b. XBLK before XNM ----------------------------------------------------
-# Upstream flushes XNM > XBLK > XUNI, and list_flush_batch reads the queue from
-# the head and stops at the wave cap (64 live, 128 fetched). A few XBLK sitting
-# behind thousands of XNM therefore never enter a wave at all. This flips the
-# priority AND buckets the selection by it, so XBLK go out in the first wave of
-# an m= window. Set XNM_XBLK_FIRST=0 to build stock upstream instead.
+# --- 3b. local patches ------------------------------------------------------
+# 1. XBLK before XNM. Upstream flushes XNM > XBLK > XUNI, and list_flush_batch
+#    reads the queue head-first and stops at the wave cap, so a few XBLK behind
+#    thousands of XNM never enter a wave. Flips the priority AND the selection.
+# 2. One dropped connection no longer aborts the whole wave. Measured on a Vast
+#    host losing ~40% of connections to port 80: waves of 1024 delivered 61-127
+#    blocks because the FIRST drop killed the rest. Now only a fully lost round
+#    counts as "pool down"; partial loss just re-queues those blocks.
+# 3. Submit timeout capped at 6s, separate from the difficulty poll - a round is
+#    only as fast as its slowest member, and a blackholed socket held it for 12s.
+# Set XNM_XBLK_FIRST=0 to build stock upstream instead.
 if [ "${XNM_XBLK_FIRST:-1}" = "1" ]; then
   cat > /root/xblk-first.py <<'XBLKEOF'
 import pathlib, sys
 root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".")
 
-def swap(rel, old, new):
+def swap(rel, marker, old, new):
     p = root / rel
     s = p.read_text(encoding="utf-8")
-    if "XBLK_FIRST_PATCH" in s:
-        print("already patched:", rel); return
+    if marker in s:
+        print("already patched:", rel, marker); return
     if s.count(old) != 1:
-        raise SystemExit("no unique match in %s (found %d)" % (rel, s.count(old)))
+        raise SystemExit("no unique match for %s in %s (found %d)" % (marker, rel, s.count(old)))
     p.write_text(s.replace(old, new, 1), encoding="utf-8", newline="\n")
-    print("patched:", rel)
+    print("patched:", rel, marker)
 
-swap("src/queue/policy.cpp", """    // Priority: XNM > XBLK > XUNI (lower = flush sooner).
+# --- 1. XBLK before XNM ------------------------------------------------------
+swap("src/queue/policy.cpp", "XBLK_FIRST_PATCH", """    // Priority: XNM > XBLK > XUNI (lower = flush sooner).
     if (kind == "XNM" || kind == "XEN11" || kind == "NORMAL") return 0;
     if (kind == "XBLK") return 1;
     if (kind == "XUNI") return 2;""", """    // XBLK_FIRST_PATCH - priority: XBLK > XNM > XUNI (lower = flush sooner).
@@ -102,13 +108,14 @@ swap("src/queue/policy.cpp", """    // Priority: XNM > XBLK > XUNI (lower = flus
     if (kind == "XNM" || kind == "XEN11" || kind == "NORMAL") return 1;
     if (kind == "XUNI") return 2;""")
 
-swap("src/queue/store.cpp", """    std::vector<PendingBlock> preferred;
+swap("src/queue/store.cpp", "XBLK_FIRST_DECL", """    std::vector<PendingBlock> preferred;
     std::vector<PendingBlock> wrapped;
     preferred.reserve(static_cast<size_t>(std::max(cap, 0)));
-    wrapped.reserve(static_cast<size_t>(std::max(cap, 0)));""", """    std::vector<PendingBlock> preferred;
+    wrapped.reserve(static_cast<size_t>(std::max(cap, 0)));""", """    // XBLK_FIRST_DECL
+    std::vector<PendingBlock> preferred;
     preferred.reserve(static_cast<size_t>(std::max(cap, 0)));""")
 
-swap("src/queue/store.cpp", """    for (const auto& pb : pending_) {
+swap("src/queue/store.cpp", "XBLK_FIRST_PATCH", """    for (const auto& pb : pending_) {
         if (skip_before_id > 0 && pb.id < skip_before_id) take(wrapped, pb);
         else take(preferred, pb);
         if (static_cast<int>(preferred.size()) >= cap) break;
@@ -141,15 +148,74 @@ swap("src/queue/store.cpp", """    for (const auto& pb : pending_) {
             preferred.push_back(std::move(pb));
         }
     }""")
+
+# --- 2. one dropped connection must not abort the whole wave -----------------
+swap("src/app/supervisor.cpp", "WAVE_TOLERANCE_DECL", """    int flushed = 0;
+    int holds = 0;
+    int last_hold_status = 0;
+    std::string last_hold_hint;
+    bool transport_fail = false;""", """    int flushed = 0;
+    int holds = 0;
+    int last_hold_status = 0;
+    std::string last_hold_hint;
+    bool transport_fail = false;
+    // WAVE_TOLERANCE_DECL - a lossy link drops individual connections; upstream
+    // aborted the whole 1024-block wave on the FIRST one, so a ~40% drop rate
+    // delivered 61-127 blocks per wave instead of 1024. Count drops instead and
+    // only give up when a full round is lost, which is what a dead pool looks like.
+    int transport_fails = 0;
+    int last_transport_status = 0;
+    size_t round_fails = 0;""")
+
+swap("src/app/supervisor.cpp", "WAVE_TOLERANCE_ROUND", """        const size_t n = std::min(static_cast<size_t>(parallel), work.size() - base);
+        std::vector<std::future<SubmitResult>> futs;""", """        const size_t n = std::min(static_cast<size_t>(parallel), work.size() - base);
+        round_fails = 0;                      // WAVE_TOLERANCE_ROUND
+        const int flushed_before_round = flushed;
+        std::vector<std::future<SubmitResult>> futs;""")
+
+swap("src/app/supervisor.cpp", "WAVE_TOLERANCE_COUNT", """                if (!on_shutdown) {
+                    note_submit_transport_failure("Queue flush", result.status);
+                    transport_fail = true;
+                }""", """                if (!on_shutdown) {       // WAVE_TOLERANCE_COUNT
+                    ++transport_fails;
+                    ++round_fails;
+                    last_transport_status = result.status;
+                }""")
+
+swap("src/app/supervisor.cpp", "WAVE_TOLERANCE_ABORT", """        if (!accepted_ids.empty()) store_->mark_submitted_many(accepted_ids);
+    }""", """        if (!accepted_ids.empty()) store_->mark_submitted_many(accepted_ids);
+        // WAVE_TOLERANCE_ABORT - whole round lost and nothing accepted: treat as
+        // pool down (backoff, keep the bag). Partial loss only costs those blocks
+        // a later retry - they were never marked submitted, so they stay queued.
+        if (!on_shutdown && round_fails == n && flushed == flushed_before_round) {
+            note_submit_transport_failure("Queue flush", last_transport_status);
+            transport_fail = true;
+        }
+    }""")
+
+swap("src/app/supervisor.cpp", "WAVE_TOLERANCE_LOG", """        log("info", "Submitted " + std::to_string(flushed) + " queued block(s) (" + context +
+                        ", CPU submit x" + std::to_string(parallel) + ")");""", """        log("info", "Submitted " + std::to_string(flushed) + " queued block(s) (" + context +
+                        ", CPU submit x" + std::to_string(parallel) +
+                        (transport_fails ? ", " + std::to_string(transport_fails) + " dropped"
+                                         : std::string()) +   // WAVE_TOLERANCE_LOG
+                        ")");""")
+
+# --- 3. submit timeout separate from the difficulty poll ---------------------
+swap("src/app/supervisor.cpp", "SUBMIT_TIMEOUT_PATCH", """    // CPU submit path: allow full configured timeout (does not block CUDA).
+    return settings_.connection_timeout_s > 0 ? settings_.connection_timeout_s : 8;""", """    // SUBMIT_TIMEOUT_PATCH - a round of `parallel` submits is only as fast as its
+    // slowest member, so one blackholed connection used to hold a whole round for
+    // the full 12s. Cap the submit path; the difficulty poll keeps the long one.
+    const int cfg = settings_.connection_timeout_s > 0 ? settings_.connection_timeout_s : 8;
+    return std::min(cfg, 6);""")
 XBLKEOF
   # Fail loud: if upstream ever renames these blocks the patch must not silently
   # no-op into a stock build that still sends XNM first.
-  XBLK_OUT="$(python3 /root/xblk-first.py "$BASE" 2>&1)"     || die "XBLK-first patch failed (upstream source changed?): ${XBLK_OUT} - re-run with XNM_XBLK_FIRST=0 to build stock"
+  XBLK_OUT="$(python3 /root/xblk-first.py "$BASE" 2>&1)"     || die "local patch failed (upstream source changed?): ${XBLK_OUT} - re-run with XNM_XBLK_FIRST=0 to build stock"
   if printf '%s' "$XBLK_OUT" | grep -q "^patched:"; then
-    log "XBLK-first: source patched - forcing rebuild"
+    log "Local patches applied - forcing rebuild"
     rm -f "$BASE/build/bin/xnminer"
   else
-    log "XBLK-first: already applied"
+    log "Local patches already applied"
   fi
 fi
 
@@ -215,6 +281,7 @@ from datetime import datetime, timedelta
 PATTERN = sys.argv[1] if len(sys.argv) > 1 else "/root/xnm-gpu*"
 REFRESH_S = 3.0
 STALE_AFTER_S = 90.0          # samples land every 30s
+RESTART_GAP_S = 300.0        # a bigger hole between samples means a restart
 DIFF_POLL_S = 20.0
 
 POOL_DIFF = "http://xenblocks.io/difficulty"
@@ -299,18 +366,40 @@ def last_sample(path: str) -> dict:
     return {}
 
 
-def first_ts(path: str) -> float:
+def run_start_ts(path: str) -> float:
+    """Start of the CURRENT run, not the age of the file.
+
+    timelapse.cpp opens the file with ios::app and never truncates it, so the
+    first line survives every restart - reading it reported "Up 8h36m" for a
+    miner that had been restarted minutes earlier. Walk the samples instead and
+    take the last point preceded by a restart-sized hole. Only the tail is read,
+    so a run older than that window reads as starting at the window edge.
+    """
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if not line.strip().startswith("{"):
-                    continue
-                rec = json.loads(line)
-                if "hps" in rec:
-                    return parse_ts(rec.get("ts"))
-    except (OSError, json.JSONDecodeError):
-        pass
-    return 0.0
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - 4_000_000))
+            chunk = f.read().decode("utf-8", "replace")
+    except OSError:
+        return 0.0
+    start = prev = 0.0
+    for line in chunk.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue          # first line of the window is usually a partial
+        if "hps" not in rec:
+            continue
+        ts = parse_ts(rec.get("ts"))
+        if not ts:
+            continue
+        if not start or (prev and ts - prev > RESTART_GAP_S):
+            start = ts
+        prev = ts
+    return start
 
 
 def mining_day() -> str:
@@ -439,7 +528,7 @@ def render(dirs, cards) -> str:
         tot_queue += queued
         tot_power += nv.get("power", 0.0)
 
-        up = (now - first_ts(os.path.join(data_dir, "session_timelapse.jsonl"))) if s else 0.0
+        up = (now - run_start_ts(os.path.join(data_dir, "session_timelapse.jsonl"))) if s else 0.0
         longest_up = max(longest_up, up)
 
         if not s:

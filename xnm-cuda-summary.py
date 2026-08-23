@@ -26,6 +26,7 @@ from datetime import datetime, timedelta
 PATTERN = sys.argv[1] if len(sys.argv) > 1 else "/root/xnm-gpu*"
 REFRESH_S = 3.0
 STALE_AFTER_S = 90.0          # samples land every 30s
+RESTART_GAP_S = 300.0        # a bigger hole between samples means a restart
 DIFF_POLL_S = 20.0
 
 POOL_DIFF = "http://xenblocks.io/difficulty"
@@ -110,18 +111,40 @@ def last_sample(path: str) -> dict:
     return {}
 
 
-def first_ts(path: str) -> float:
+def run_start_ts(path: str) -> float:
+    """Start of the CURRENT run, not the age of the file.
+
+    timelapse.cpp opens the file with ios::app and never truncates it, so the
+    first line survives every restart - reading it reported "Up 8h36m" for a
+    miner that had been restarted minutes earlier. Walk the samples instead and
+    take the last point preceded by a restart-sized hole. Only the tail is read,
+    so a run older than that window reads as starting at the window edge.
+    """
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if not line.strip().startswith("{"):
-                    continue
-                rec = json.loads(line)
-                if "hps" in rec:
-                    return parse_ts(rec.get("ts"))
-    except (OSError, json.JSONDecodeError):
-        pass
-    return 0.0
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - 4_000_000))
+            chunk = f.read().decode("utf-8", "replace")
+    except OSError:
+        return 0.0
+    start = prev = 0.0
+    for line in chunk.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue          # first line of the window is usually a partial
+        if "hps" not in rec:
+            continue
+        ts = parse_ts(rec.get("ts"))
+        if not ts:
+            continue
+        if not start or (prev and ts - prev > RESTART_GAP_S):
+            start = ts
+        prev = ts
+    return start
 
 
 def mining_day() -> str:
@@ -250,7 +273,7 @@ def render(dirs, cards) -> str:
         tot_queue += queued
         tot_power += nv.get("power", 0.0)
 
-        up = (now - first_ts(os.path.join(data_dir, "session_timelapse.jsonl"))) if s else 0.0
+        up = (now - run_start_ts(os.path.join(data_dir, "session_timelapse.jsonl"))) if s else 0.0
         longest_up = max(longest_up, up)
 
         if not s:
