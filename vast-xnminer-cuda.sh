@@ -65,7 +65,13 @@ nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 # --- 3. source + build once -------------------------------------------------
 if [ -d "$BASE/.git" ]; then
   log "Source present - updating"
-  git -C "$BASE" pull --ff-only >/dev/null 2>&1 || log "pull skipped (local changes?)"
+  # Our patches live on top of a PRISTINE tree, so drop them before pulling.
+  # Otherwise --ff-only is blocked by local changes, and a NEWER patch set finds
+  # nothing to match in blocks an older one already rewrote (exactly what broke
+  # an in-place upgrade). Re-applied in 3b. Per-card miner.ini and data/ live
+  # outside $BASE, so no config and no queue is touched.
+  git -C "$BASE" checkout -- . >/dev/null 2>&1 || true
+  git -C "$BASE" pull --ff-only >/dev/null 2>&1 || log "pull skipped"
 else
   log "Cloning ${REPO}"
   git clone --depth 1 "$REPO" "$BASE"
@@ -85,7 +91,7 @@ chmod +x ./*.sh
 #    only as fast as its slowest member, and a blackholed socket held it for 12s.
 # Set XNM_XBLK_FIRST=0 to build stock upstream instead.
 if [ "${XNM_XBLK_FIRST:-1}" = "1" ]; then
-  cat > /root/xblk-first.py <<'XBLKEOF'
+  cat > /root/xnm-patches.py <<'XBLKEOF'
 import pathlib, sys
 root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else ".")
 
@@ -210,12 +216,18 @@ swap("src/app/supervisor.cpp", "SUBMIT_TIMEOUT_PATCH", """    // CPU submit path
 XBLKEOF
   # Fail loud: if upstream ever renames these blocks the patch must not silently
   # no-op into a stock build that still sends XNM first.
-  XBLK_OUT="$(python3 /root/xblk-first.py "$BASE" 2>&1)"     || die "local patch failed (upstream source changed?): ${XBLK_OUT} - re-run with XNM_XBLK_FIRST=0 to build stock"
-  if printf '%s' "$XBLK_OUT" | grep -q "^patched:"; then
-    log "Local patches applied - forcing rebuild"
+  XBLK_OUT="$(python3 /root/xnm-patches.py "$BASE" 2>&1)"     || die "local patch failed (upstream source changed?): ${XBLK_OUT} - re-run with XNM_XBLK_FIRST=0 to build stock"
+  # Sources are re-patched on EVERY run (costs milliseconds), so what sits on
+  # disk always matches this script and can be verified with grep. The stamp
+  # decides only whether a rebuild is needed.
+  XBLK_STAMP="$BASE/.xnm-patch-stamp"
+  XBLK_WANT="$(md5sum /root/xnm-patches.py | cut -d" " -f1)"
+  if [ ! -x "$BASE/build/bin/xnminer" ] || [ "$(cat "$XBLK_STAMP" 2>/dev/null)" != "$XBLK_WANT" ]; then
+    log "Patch set $(printf '%s' "$XBLK_WANT" | cut -c1-8) is new - forcing rebuild"
     rm -f "$BASE/build/bin/xnminer"
+    echo "$XBLK_WANT" > "$XBLK_STAMP"
   else
-    log "Local patches already applied"
+    log "Local patches current - reusing existing binary"
   fi
 fi
 
