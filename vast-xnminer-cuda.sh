@@ -102,6 +102,280 @@ for i in $(seq 0 $((GPUS - 1))); do
   cd "$BASE"
 done
 
+# --- 4b. summary view -------------------------------------------------------
+# Reads each miner's own data/session_timelapse.jsonl plus live nvidia-smi.
+# Standard library only - the C++ miner pulls in no Python packages.
+log "Writing summary view"
+cat > "${BASE}/xnm-cuda-summary.py" <<'PYSUMEOF'
+#!/usr/bin/env python3
+"""One screen for every per-GPU xnminer instance.
+
+Reads what each miner already writes - data/session_timelapse.jsonl, one JSON
+object per line - and pairs it with live nvidia-smi output. Standard library
+only: the C++ miner pulls in no Python, so nothing here may either.
+
+  python3 xnm-cuda-summary.py [glob]     default: /root/xnm-gpu*
+"""
+from __future__ import annotations
+
+import glob as globmod
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+PATTERN = sys.argv[1] if len(sys.argv) > 1 else "/root/xnm-gpu*"
+REFRESH_S = 3.0
+STALE_AFTER_S = 90.0          # samples land every 30s
+
+C = {
+    "off": "\033[0m", "dim": "\033[90m", "b": "\033[1m",
+    "cyan": "\033[96m", "green": "\033[92m", "yellow": "\033[93m",
+    "red": "\033[91m", "white": "\033[97m", "celadon": "\033[38;2;172;225;175m",
+}
+
+
+def paint(text: str, *styles: str) -> str:
+    return "".join(C[s] for s in styles) + text + C["off"]
+
+
+def gpu_index_of(name: str) -> int:
+    m = re.search(r"(\d+)$", name)
+    return int(m.group(1)) if m else 0
+
+
+def last_sample(path: str) -> dict:
+    """Last JSON line. Read the tail so the file can grow without bound."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - 32768))
+            chunk = f.read().decode("utf-8", "replace")
+    except OSError:
+        return {}
+    for line in reversed(chunk.splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    return {}
+
+
+def first_ts(path: str) -> float:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.strip().startswith("{"):
+                    return parse_ts(json.loads(line).get("ts"))
+    except (OSError, json.JSONDecodeError):
+        pass
+    return 0.0
+
+
+def parse_ts(value) -> float:
+    if not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(str(value)).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def nvidia_smi() -> dict:
+    """index -> live card state. Empty dict if nvidia-smi is unavailable."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=index,name,utilization.gpu,temperature.gpu,power.draw,"
+             "memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=8,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    cards = {}
+    for line in out.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 7:
+            continue
+        try:
+            cards[int(parts[0])] = {
+                "name": parts[1].replace("NVIDIA ", ""),
+                "util": int(float(parts[2])),
+                "temp": int(float(parts[3])),
+                "power": float(parts[4]),
+                "vram_used": int(float(parts[5])),
+                "vram_total": int(float(parts[6])),
+            }
+        except ValueError:
+            continue
+    return cards
+
+
+def hps_fmt(v: float) -> str:
+    if v >= 1_000_000:
+        return f"{v / 1_000_000:.2f}M"
+    if v >= 1000:
+        return f"{v / 1000:.1f}k"
+    return f"{v:.0f}"
+
+
+def dur(seconds: float) -> str:
+    s = int(max(0, seconds))
+    d, rem = divmod(s, 86400)
+    h, rem = divmod(rem, 3600)
+    m, _ = divmod(rem, 60)
+    if d:
+        return f"{d}d{h:02d}h"
+    if h:
+        return f"{h}h{m:02d}m"
+    return f"{m}m"
+
+
+COLS = [("GPU", 4), ("Card", 14), ("Up", 7), ("H/s", 8), ("Util", 5),
+        ("Temp", 6), ("Mem", 6), ("Power", 7), ("VRAM", 11),
+        ("Accept", 7), ("Queue", 7), ("Net", 8)]
+
+
+def row(cells, styles=None) -> str:
+    out = []
+    for (label, width), cell in zip(COLS, cells):
+        text = str(cell)
+        visible = len(re.sub(r"\033\[[0-9;]*m", "", text))
+        pad = " " * max(0, width - visible)
+        out.append((pad + text) if label in ("GPU", "Up", "H/s", "Util", "Temp",
+                                             "Mem", "Power", "VRAM", "Accept",
+                                             "Queue") else (text + pad))
+    return "  ".join(out)
+
+
+def render(dirs, cards) -> str:
+    now = time.time()
+    lines = []
+
+    tot_hps = tot_power = 0.0
+    tot_accept = tot_queue = live = 0
+    longest_up = 0.0
+    net_state = None
+
+    body = []
+    for d in dirs:
+        idx = gpu_index_of(os.path.basename(d))
+        tl = os.path.join(d, "data", "session_timelapse.jsonl")
+        s = last_sample(tl)
+        nv = cards.get(idx, {})
+
+        age = now - parse_ts(s.get("ts"))
+        fresh = bool(s) and age < STALE_AFTER_S
+        hps = float(s.get("hps") or 0.0) if fresh else 0.0
+        if fresh:
+            live += 1
+            tot_hps += hps
+        tot_accept += int(s.get("accepted") or 0)
+        tot_queue += int(s.get("queued") or 0)
+        tot_power += nv.get("power", 0.0)
+
+        up = (now - first_ts(tl)) if s else 0.0
+        longest_up = max(longest_up, up)
+
+        if not s:
+            net = paint("—", "dim")
+        elif not fresh:
+            net = paint("stale", "yellow", "b")
+        elif s.get("network_ok"):
+            net = paint("online", "green")
+            net_state = True
+        else:
+            net = paint("offline", "red", "b")
+            if net_state is None:
+                net_state = False
+
+        temp = nv.get("temp", s.get("temp_c", 0))
+        mem_j = s.get("memory_junction_c")
+        vram = (f"{nv['vram_used'] / 1024:.1f}/{nv['vram_total'] / 1024:.0f}G"
+                if "vram_total" in nv else "—")
+        queued = int(s.get("queued") or 0)
+
+        body.append(row([
+            paint(str(idx), "b"),
+            nv.get("name", "?"),
+            dur(up) if s else paint("—", "dim"),
+            paint(hps_fmt(hps), "cyan") if fresh else paint("—", "dim"),
+            f"{nv['util']}%" if "util" in nv else "—",
+            paint(f"{temp}C", "red", "b") if temp and temp >= 84 else f"{temp}C",
+            f"{mem_j}C" if mem_j else paint("—", "dim"),
+            f"{nv['power']:.0f}W" if "power" in nv else "—",
+            vram,
+            paint(str(int(s.get("accepted") or 0)), "green"),
+            paint(str(queued), "yellow") if queued else "0",
+            net,
+        ]))
+
+    head = "  ".join(
+        (label.rjust(w) if label in ("GPU", "Up", "H/s", "Util", "Temp", "Mem",
+                                     "Power", "VRAM", "Accept", "Queue")
+         else label.ljust(w))
+        for label, w in COLS)
+
+    title = (paint("XenBlocks", "b", "white") + "  " +
+             paint("wszystkie karty", "dim") + "   " +
+             paint(f"{live}/{len(dirs)} kopie", "b", "celadon") + "   " +
+             paint(f"praca {dur(longest_up)}", "white") + "   " +
+             paint(time.strftime("%H:%M:%S"), "dim"))
+
+    lines.append(title)
+    lines.append("")
+    lines.append(paint(head, "b", "cyan"))
+    lines.append(paint("-" * len(re.sub(r"\033\[[0-9;]*m", "", head)), "dim"))
+    lines.extend(body)
+    lines.append(paint("-" * len(re.sub(r"\033\[[0-9;]*m", "", head)), "dim"))
+    lines.append(row([
+        paint("ALL", "b"), "", dur(longest_up),
+        paint(hps_fmt(tot_hps), "b", "cyan"), "", "", "",
+        paint(f"{tot_power:.0f}W", "b") if tot_power else "",
+        "", paint(str(tot_accept), "b", "green"),
+        paint(str(tot_queue), "b", "yellow") if tot_queue else "0", "",
+    ]))
+    lines.append("")
+
+    if tot_queue:
+        lines.append(paint(
+            f"Kolejka {tot_queue} blok(ow) czeka na okno m=100 - nie kasuj instancji, "
+            "dopoki nie zejdzie do zera.", "yellow"))
+    lines.append(paint(
+        "Ctrl+B potem cyfra = karta   |   Ctrl+C zamyka TYLKO ten podglad, "
+        "nie minery", "dim"))
+    return "\n".join(lines)
+
+
+def main() -> int:
+    try:
+        while True:
+            dirs = sorted(
+                (d for d in globmod.glob(PATTERN) if os.path.isdir(d)),
+                key=lambda d: gpu_index_of(os.path.basename(d)),
+            )
+            screen = (render(dirs, nvidia_smi()) if dirs
+                      else paint(f"Brak katalogow pasujacych do {PATTERN}", "red", "b"))
+            sys.stdout.write("\033[H\033[J" + screen + "\n")
+            sys.stdout.flush()
+            time.sleep(REFRESH_S)
+    except KeyboardInterrupt:
+        sys.stdout.write("\033[?25h\n")
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PYSUMEOF
+chmod +x "${BASE}/xnm-cuda-summary.py"
+command -v python3 >/dev/null 2>&1 || apt-get install -y -qq python3 >/dev/null 2>&1 || true
+
 # --- 5. launch --------------------------------------------------------------
 if [ -n "${TMUX:-}" ] && [ "$(tmux display-message -p '#S' 2>/dev/null)" = "$SESSION" ]; then
   die "You are inside tmux session '$SESSION'. Detach (Ctrl+B then D) and re-run."
@@ -117,7 +391,12 @@ for i in $(seq 0 $((GPUS - 1))); do
   fi
 done
 
-log "${GPUS} miner(s) running in tmux session '${SESSION}'"
+# Summary window last, so windows 0..N-1 keep matching the GPU numbers.
+tmux new-window -t "$SESSION" -n "all"   "cd ${BASE} && python3 xnm-cuda-summary.py '/root/xnm-gpu*'; exec bash"
+tmux select-window -t "${SESSION}:all"
+
+log "${GPUS} miner(s) + summary running in tmux session '${SESSION}'"
+echo "  summary:      Ctrl+B then ${GPUS}"
 echo "  switch card:  Ctrl+B then 0 .. $((GPUS - 1))"
 echo "  detach:       Ctrl+B then D"
 echo "  re-attach:    tmux attach -t ${SESSION}"
