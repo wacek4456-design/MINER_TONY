@@ -89,6 +89,9 @@ chmod +x ./*.sh
 #    counts as "pool down"; partial loss just re-queues those blocks.
 # 3. Submit timeout capped at 6s, separate from the difficulty poll - a round is
 #    only as fast as its slowest member, and a blackholed socket held it for 12s.
+# 4. "already exists" no longer counts as a mined block. It still leaves the
+#    queue (right), but retries made the daily XNM/XBLK totals run far past what
+#    the pool credits - 152 XBLK claimed in a day vs 93 superblocks all time.
 # Set XNM_XBLK_FIRST=0 to build stock upstream instead.
 if [ "${XNM_XBLK_FIRST:-1}" = "1" ]; then
   cat > /root/xnm-patches.py <<'XBLKEOF'
@@ -171,7 +174,8 @@ swap("src/app/supervisor.cpp", "WAVE_TOLERANCE_DECL", """    int flushed = 0;
     // only give up when a full round is lost, which is what a dead pool looks like.
     int transport_fails = 0;
     int last_transport_status = 0;
-    size_t round_fails = 0;""")
+    size_t round_fails = 0;
+    int duplicates = 0;       // pool said "already exists": left the queue, not mined""")
 
 swap("src/app/supervisor.cpp", "WAVE_TOLERANCE_ROUND", """        const size_t n = std::min(static_cast<size_t>(parallel), work.size() - base);
         std::vector<std::future<SubmitResult>> futs;""", """        const size_t n = std::min(static_cast<size_t>(parallel), work.size() - base);
@@ -204,6 +208,8 @@ swap("src/app/supervisor.cpp", "WAVE_TOLERANCE_LOG", """        log("info", "Sub
                         ", CPU submit x" + std::to_string(parallel) +
                         (transport_fails ? ", " + std::to_string(transport_fails) + " dropped"
                                          : std::string()) +   // WAVE_TOLERANCE_LOG
+                        (duplicates ? ", " + std::to_string(duplicates) + " dup"
+                                    : std::string()) +
                         ")");""")
 
 # --- 3. submit timeout separate from the difficulty poll ---------------------
@@ -213,6 +219,78 @@ swap("src/app/supervisor.cpp", "SUBMIT_TIMEOUT_PATCH", """    // CPU submit path
     // the full 12s. Cap the submit path; the difficulty poll keeps the long one.
     const int cfg = settings_.connection_timeout_s > 0 ? settings_.connection_timeout_s : 8;
     return std::min(cfg, 6);""")
+
+# --- 4. "already exists" is a duplicate, not a mined block -------------------
+swap("src/network/submitter.hpp", "DUPLICATE_COUNT_DECL",
+     """bool is_pool_hold(int status, const std::string& body);""",
+     """bool is_pool_hold(int status, const std::string& body);
+bool is_duplicate_submit(const std::string& body);   // DUPLICATE_COUNT_DECL""")
+
+swap("src/network/submitter.cpp", "DUPLICATE_COUNT_FN", """bool submit_accepted(int status, const std::string& body) {
+    if (status >= 200 && status < 300) return true;
+    auto l = lower(body);
+    return l.find("already exists") != std::string::npos;
+}""", """bool submit_accepted(int status, const std::string& body) {
+    if (status >= 200 && status < 300) return true;
+    auto l = lower(body);
+    return l.find("already exists") != std::string::npos;
+}
+
+// DUPLICATE_COUNT_FN - "already exists" means the pool already holds this block.
+// Dropping it from the queue is right; counting it as mined is not. Retries are
+// routine here (a wave can die mid-flight and the block goes out again), so the
+// daily XNM/XBLK totals ran far past what the pool actually credited: 152 XBLK
+// claimed for one day against 93 superblocks credited for all time.
+// Body-only on purpose: a 2xx carrying that phrase is still a duplicate.
+bool is_duplicate_submit(const std::string& body) {
+    return lower(body).find("already exists") != std::string::npos;
+}""")
+
+swap("src/app/supervisor.cpp", "DUPLICATE_COUNT_FLUSH", """            if (result.ok) {
+                accepted_ids.push_back(item.id);
+                metrics_->record_accepted_flush(item.hit.block_type);
+                local_stats_->record_accept(item.hit.block_type);
+                xbs_.report_accepted(settings_.address, item.hit.block_type, item.hit.key,
+                                     item.hit.hash_str, settings_.worker,
+                                     item.hit.memory_cost.value_or(mining_difficulty()));
+                ++flushed;""", """            if (result.ok) {
+                accepted_ids.push_back(item.id);
+                // DUPLICATE_COUNT_FLUSH - still leaves the queue, but never counts.
+                if (is_duplicate_submit(result.body)) {
+                    ++duplicates;
+                } else {
+                    metrics_->record_accepted_flush(item.hit.block_type);
+                    local_stats_->record_accept(item.hit.block_type);
+                    xbs_.report_accepted(settings_.address, item.hit.block_type, item.hit.key,
+                                         item.hit.hash_str, settings_.worker,
+                                         item.hit.memory_cost.value_or(mining_difficulty()));
+                }
+                ++flushed;""")
+
+swap("src/app/supervisor.cpp", "DUPLICATE_COUNT_LIVE", """        metrics_->record_accepted_live(kind);
+        local_stats_->record_accept(kind);
+        auto hint = submit_response_hint(result.status, result.body);
+        ui_event("ACCEPTED", kind, hint);
+        log("info", "SUBMIT OK " + kind + " " + hint + " (CPU submit worker)");
+        store_->record_direct_submit(hit, result.status, result.body);
+        xbs_.report_accepted(settings_.address, kind, hit.key, hit.hash_str, settings_.worker,
+                             hit.memory_cost.value_or(mining_difficulty()));
+        return;""", """        // DUPLICATE_COUNT_LIVE - same rule as the flush path.
+        const bool dup = is_duplicate_submit(result.body);
+        if (!dup) {
+            metrics_->record_accepted_live(kind);
+            local_stats_->record_accept(kind);
+        }
+        auto hint = submit_response_hint(result.status, result.body);
+        ui_event(dup ? "DUPLICATE" : "ACCEPTED", kind, hint);
+        log("info", std::string(dup ? "SUBMIT DUP " : "SUBMIT OK ") + kind + " " + hint +
+                        " (CPU submit worker)");
+        store_->record_direct_submit(hit, result.status, result.body);
+        if (!dup) {
+            xbs_.report_accepted(settings_.address, kind, hit.key, hit.hash_str, settings_.worker,
+                                 hit.memory_cost.value_or(mining_difficulty()));
+        }
+        return;""")
 XBLKEOF
   # Fail loud: if upstream ever renames these blocks the patch must not silently
   # no-op into a stock build that still sends XNM first.
