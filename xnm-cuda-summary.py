@@ -28,9 +28,11 @@ REFRESH_S = 3.0
 STALE_AFTER_S = 90.0          # samples land every 30s
 RESTART_GAP_S = 300.0        # a bigger hole between samples means a restart
 QUEUE_SCAN_S = 30.0          # blocks.db parse is slow on a big queue
+BLOCK_STALE_S = 600.0        # lastblock feed froze for 49 min once; flag it
 DIFF_POLL_S = 20.0
 
 POOL_DIFF = "http://xenblocks.io/difficulty"
+POOL_HTTPS = "https://xenblocks.io/v1/leaderboard"
 LASTBLOCK = "http://xenblocks.io:4445/getblocks/lastblock"
 LASTBLOCK_ALT = "http://xenblocks.io:4447/getblocks/lastblock"
 
@@ -40,7 +42,7 @@ C = {
     "red": "\033[91m", "white": "\033[97m", "celadon": "\033[38;2;172;225;175m",
 }
 
-NET = {"target": None, "block": None, "at": 0.0}
+NET = {"target": None, "src": "", "block": None, "block_age": None, "at": 0.0}
 QUEUE_MIX = {"at": 0.0, "counts": {"XNM": 0, "XBLK": 0, "XUNI": 0}}
 _lock = threading.Lock()
 
@@ -62,15 +64,21 @@ def plain(text: str) -> str:
 # survives a bad route to 80), and its number is real - just a different one:
 # the m= of the newest ACCEPTED block, not the target the pool is asking for.
 # Those two genuinely disagree, so the caller labels the fallback on screen.
-def _difficulty_from_lastblock(url: str) -> int | None:
-    """m= of the newest accepted block, parsed out of its argon2 hash."""
+def _difficulty_from_lastblock(url: str):
+    """(m= of newest accepted block, seconds since it landed).
+
+    The age matters: this feed FROZE at 18:29:21 and kept serving the same
+    block for 49 minutes while the chain went on accepting (rank 1 gained 1071
+    blocks over the same window). Shown without its age it reads as current and
+    is simply wrong, so the caller prints how old it is.
+    """
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "xnm-summary"})
         with urllib.request.urlopen(req, timeout=8) as r:
             data = json.loads(r.read().decode("utf-8", "replace"))
     except Exception:
-        return None
-    best_id, best_m = -1, None
+        return None, None
+    best_id, best_m, best_date = -1, None, None
     for rec in data if isinstance(data, list) else []:
         if not isinstance(rec, dict):
             continue
@@ -82,40 +90,53 @@ def _difficulty_from_lastblock(url: str) -> int | None:
         except (TypeError, ValueError):
             bid = 0
         if bid >= best_id:
-            best_id, best_m = bid, int(found.group(1))
-    return best_m
+            best_id, best_m, best_date = bid, int(found.group(1)), rec.get("date")
+    age = None
+    if best_date:
+        try:
+            age = (datetime.now() - datetime.strptime(str(best_date),
+                                                      "%Y-%m-%d %H:%M:%S")).total_seconds()
+        except ValueError:
+            age = None
+    return best_m, age
 
 
-def _fetch_difficulty() -> tuple[int | None, int | None]:
-    """(target, newest accepted block m=). Two different numbers, both shown.
+def _fetch_difficulty():
+    """(target, where it came from, newest-block m=, that block's age).
 
-    Collapsing them into one "difficulty" is what made this misleading: the
-    explorer showed 8100 while /difficulty said 6100 and the newest block was
-    still m=1100, all within minutes. The miner flushes when EITHER oracle
-    matches its bag, so the screen shows both rather than picking a winner.
+    Target first from /difficulty on port 80, then from the HTTPS leaderboard -
+    those two were checked against each other and agreed exactly (11100 vs
+    11100), so the leaderboard is a sound stand-in when a host cannot reach
+    port 80. The block feed is NOT a stand-in for the target: it is a different
+    number and it can freeze.
     """
-    target = None
-    try:
-        req = urllib.request.Request(POOL_DIFF, headers={"User-Agent": "xnm-summary"})
-        with urllib.request.urlopen(req, timeout=6) as r:
-            data = json.loads(r.read().decode("utf-8", "replace"))
-        target = int(data.get("difficulty", data.get("diff", 0))) or None
-    except Exception:
-        target = None
-    block = None
+    target, src = None, ""
+    for url, label in ((POOL_DIFF, "pool"), (POOL_HTTPS, "https")):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "xnm-summary"})
+            with urllib.request.urlopen(req, timeout=6) as r:
+                data = json.loads(r.read().decode("utf-8", "replace"))
+            value = int(data.get("difficulty", data.get("diff", 0)))
+            if value:
+                target, src = value, label
+                break
+        except Exception:
+            continue
+    block = age = None
     for url in (LASTBLOCK, LASTBLOCK_ALT):
-        block = _difficulty_from_lastblock(url)
+        block, age = _difficulty_from_lastblock(url)
         if block:
             break
-    return target, block
+    return target, src, block, age
 
 
 def _difficulty_worker() -> None:
     while True:
-        target, block = _fetch_difficulty()
+        target, src, block, age = _fetch_difficulty()
         if target or block:
             with _lock:
-                NET.update(target=target, block=block, at=time.time())
+                NET.update(target=target, src=src, block=block, block_age=age,
+                           at=time.time())
         time.sleep(DIFF_POLL_S)
 
 
@@ -386,17 +407,24 @@ def render(dirs, cards) -> str:
     rule = paint("-" * len(plain(head)), "dim")
 
     with _lock:
-        target, block, at = NET["target"], NET["block"], NET["at"]
+        target, src = NET["target"], NET["src"]
+        block, b_age, at = NET["block"], NET["block_age"], NET["at"]
     if target or block:
         # Two oracles, two numbers. Never merge them - the miner flushes when
-        # EITHER matches its bag, and they routinely disagree.
+        # EITHER matches its bag, and they routinely disagree. The block feed
+        # also freezes, so it is always stamped with its age.
         parts = []
         if target:
-            parts.append(paint(f"cel m={target}", "b", "celadon"))
+            tag = "" if src == "pool" else paint(" (https)", "dim")
+            parts.append(paint(f"cel m={target}", "b", "celadon") + tag)
         else:
             parts.append(paint("cel m=?", "red", "b"))
         if block:
-            parts.append(paint(f"ost.blok m={block}", "b", "celadon"))
+            stale = b_age is None or b_age > BLOCK_STALE_S
+            colour = "red" if stale else "celadon"
+            when = f" ({dur(b_age)} temu)" if b_age is not None else " (wiek ?)"
+            parts.append(paint(f"ost.blok m={block}", "b", colour) +
+                         paint(when, "red" if stale else "dim"))
         diff_txt = paint("siec ", "dim") + paint(" / ", "dim").join(parts)
     elif at:
         diff_txt = paint("siec: brak odpowiedzi", "red", "b")
