@@ -813,11 +813,15 @@ def render(dirs, cards) -> str:
         else:
             parts.append(paint("cel m=?", "red", "b"))
         if block:
-            stale = b_age is None or b_age > BLOCK_STALE_S
-            colour = "red" if stale else "celadon"
-            when = f" ({dur(b_age)} temu)" if b_age is not None else " (wiek ?)"
-            parts.append(paint(f"ost.blok m={block}", "b", colour) +
-                         paint(when, "red" if stale else "dim"))
+            # Once the feed freezes, hide the number itself. It is still what the
+            # miner believes, but on screen a stale m= reads as current and sent
+            # us chasing an m=100 window that was not open. Say it is dead instead.
+            if b_age is None or b_age > BLOCK_STALE_S:
+                age_txt = dur(b_age) if b_age is not None else "?"
+                parts.append(paint(f"ost.blok: kanal zamarzl ({age_txt})", "b", "red"))
+            else:
+                parts.append(paint(f"ost.blok m={block}", "b", "celadon") +
+                             paint(f" ({dur(b_age)} temu)", "dim"))
         diff_txt = paint("siec ", "dim") + paint(" / ", "dim").join(parts)
     elif at:
         diff_txt = paint("siec: brak odpowiedzi", "red", "b")
