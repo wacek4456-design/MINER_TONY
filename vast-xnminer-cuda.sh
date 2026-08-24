@@ -16,7 +16,8 @@
 #   XNM_MAX_GPUS=8      cap on cards used
 #   XNM_VRAM_PCT=79.0   VRAM cap per card
 #   XNM_LANES=8         CUDA lanes per card
-#   XNM_DRAIN_PAR=128   parallel /verify workers while draining the queue
+#   XNM_DRAIN_PAR=64    parallel /verify workers per card while draining
+#                       (4 cards x 64 = 256 concurrent; 128 got an IP blocked)
 #   XNM_REPO=<url>      source repository
 set -euo pipefail
 
@@ -27,15 +28,17 @@ SESSION="xnm"
 MAX_GPUS="${XNM_MAX_GPUS:-8}"
 VRAM_PCT="${XNM_VRAM_PCT:-79.0}"
 LANES="${XNM_LANES:-8}"
-# Measured 2026-08-23 on 4x RTX 3090: a drain round is gated by its slowest
-# member and every round hit the full 6s submit timeout, so round time is
-# effectively fixed - doubling the round doubles throughput for free. Stock
-# auto-pick caps at 64 (min(64, threads*4)). At 4x64 concurrent the pool
-# dropped only 8% of connections, so there was headroom.
-# Back off to 64 if the log starts showing a big "dropped" count or
-# "/verify hold HTTP 429" - that is the pool rate-limiting, and more
-# parallelism then makes it strictly worse.
-DRAIN_PAR="${XNM_DRAIN_PAR:-128}"
+# 64 is the PROVEN value: hours of clean windows at 4x64 concurrent with ~8%
+# dropped connections.
+# ⚠ 128 was tried and looks like it got the host's IP blocked. At 4x128 = 512
+# concurrent connections the drop rate went 8% -> 82% within one wave, then the
+# pool's port 80 stopped answering that host entirely - while the SAME endpoint
+# kept serving fine through a third-party proxy from another network, and while
+# port 80 to other sites still worked from the host. A fresh instance repeated
+# it: healthy on arrival, dead within ~15 minutes of its first flush at 128.
+# The pool tolerates the traffic, not the concurrency. Do not raise this without
+# watching "dropped" over a full window first, and drop to 32 if it recurs.
+DRAIN_PAR="${XNM_DRAIN_PAR:-64}"
 
 log() { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
