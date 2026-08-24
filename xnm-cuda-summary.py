@@ -40,7 +40,7 @@ C = {
     "red": "\033[91m", "white": "\033[97m", "celadon": "\033[38;2;172;225;175m",
 }
 
-NET = {"difficulty": None, "source": "", "at": 0.0}
+NET = {"target": None, "block": None, "at": 0.0}
 QUEUE_MIX = {"at": 0.0, "counts": {"XNM": 0, "XBLK": 0, "XUNI": 0}}
 _lock = threading.Lock()
 
@@ -86,29 +86,36 @@ def _difficulty_from_lastblock(url: str) -> int | None:
     return best_m
 
 
-def _fetch_difficulty() -> tuple[int | None, str]:
+def _fetch_difficulty() -> tuple[int | None, int | None]:
+    """(target, newest accepted block m=). Two different numbers, both shown.
+
+    Collapsing them into one "difficulty" is what made this misleading: the
+    explorer showed 8100 while /difficulty said 6100 and the newest block was
+    still m=1100, all within minutes. The miner flushes when EITHER oracle
+    matches its bag, so the screen shows both rather than picking a winner.
+    """
+    target = None
     try:
         req = urllib.request.Request(POOL_DIFF, headers={"User-Agent": "xnm-summary"})
         with urllib.request.urlopen(req, timeout=6) as r:
             data = json.loads(r.read().decode("utf-8", "replace"))
-        value = int(data.get("difficulty", data.get("diff", 0)))
-        if value:
-            return value, "pool"
+        target = int(data.get("difficulty", data.get("diff", 0))) or None
     except Exception:
-        pass
+        target = None
+    block = None
     for url in (LASTBLOCK, LASTBLOCK_ALT):
-        value = _difficulty_from_lastblock(url)
-        if value:
-            return value, "ostatni blok"
-    return None, ""
+        block = _difficulty_from_lastblock(url)
+        if block:
+            break
+    return target, block
 
 
 def _difficulty_worker() -> None:
     while True:
-        value, source = _fetch_difficulty()
-        if value:
+        target, block = _fetch_difficulty()
+        if target or block:
             with _lock:
-                NET.update(difficulty=value, source=source, at=time.time())
+                NET.update(target=target, block=block, at=time.time())
         time.sleep(DIFF_POLL_S)
 
 
@@ -379,10 +386,18 @@ def render(dirs, cards) -> str:
     rule = paint("-" * len(plain(head)), "dim")
 
     with _lock:
-        diff, source, at = NET["difficulty"], NET["source"], NET["at"]
-    if diff:
-        stamp = "" if source == "pool" else paint(f" ({source})", "dim")
-        diff_txt = paint(f"siec m={diff}", "b", "celadon") + stamp
+        target, block, at = NET["target"], NET["block"], NET["at"]
+    if target or block:
+        # Two oracles, two numbers. Never merge them - the miner flushes when
+        # EITHER matches its bag, and they routinely disagree.
+        parts = []
+        if target:
+            parts.append(paint(f"cel m={target}", "b", "celadon"))
+        else:
+            parts.append(paint("cel m=?", "red", "b"))
+        if block:
+            parts.append(paint(f"ost.blok m={block}", "b", "celadon"))
+        diff_txt = paint("siec ", "dim") + paint(" / ", "dim").join(parts)
     elif at:
         diff_txt = paint("siec: brak odpowiedzi", "red", "b")
     else:
