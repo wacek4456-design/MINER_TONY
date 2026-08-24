@@ -19,6 +19,9 @@
 #   XNM_DRAIN_PAR=64    parallel /verify workers per card while draining
 #                       (4 cards x 64 = 256 concurrent; 128 got an IP blocked)
 #   XNM_REPO=<url>      source repository
+# Re-exec under bash if started as `sh script.sh`: dash chokes on the [[ =~ ]]
+# address check below, and the failure looks nothing like its cause.
+[ -n "${BASH_VERSION:-}" ] || exec bash "$0" "$@"
 set -euo pipefail
 
 WALLET="${1:-${MINER_ADDR:-0x9d79B1921b75AC7C199314406f5398E15f2fb47C}}"
