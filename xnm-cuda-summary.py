@@ -31,7 +31,8 @@ QUEUE_SCAN_S = 30.0          # blocks.db parse is slow on a big queue
 DIFF_POLL_S = 20.0
 
 POOL_DIFF = "http://xenblocks.io/difficulty"
-POOL_HTTPS = "https://xenblocks.io/v1/leaderboard"
+LASTBLOCK = "http://xenblocks.io:4445/getblocks/lastblock"
+LASTBLOCK_ALT = "http://xenblocks.io:4447/getblocks/lastblock"
 
 C = {
     "off": "\033[0m", "dim": "\033[38;2;170;170;170m", "b": "\033[1m",
@@ -53,21 +54,52 @@ def plain(text: str) -> str:
 
 
 # --- network difficulty -----------------------------------------------------
-# Port 80 is the mining API and can be slow or flaky depending on the host; the
-# HTTPS leaderboard carries the same number and stays up. Never block the UI on
-# either - a background thread refreshes, the screen reads the last value.
-def _fetch_difficulty() -> tuple[int | None, str]:
-    for url, key, label in ((POOL_DIFF, "difficulty", "pool"),
-                            (POOL_HTTPS, "difficulty", "https")):
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "xnm-summary"})
-            with urllib.request.urlopen(req, timeout=6) as r:
-                data = json.loads(r.read().decode("utf-8", "replace"))
-            value = int(data.get(key, data.get("diff", 0)))
-            if value:
-                return value, label
-        except Exception:
+# Port 80 is the mining API and goes flaky per host, so a fallback is needed.
+# It must NOT be the HTTPS leaderboard: its difficulty field sat at a stale 100
+# for hours while /difficulty said 1100 and later 6100, so the header cheerfully
+# reported an m=100 window that was not open. The lastblock feed is what the
+# miner itself uses as its second oracle, it lives on a different port (so it
+# survives a bad route to 80), and its number is real - just a different one:
+# the m= of the newest ACCEPTED block, not the target the pool is asking for.
+# Those two genuinely disagree, so the caller labels the fallback on screen.
+def _difficulty_from_lastblock(url: str) -> int | None:
+    """m= of the newest accepted block, parsed out of its argon2 hash."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "xnm-summary"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+    best_id, best_m = -1, None
+    for rec in data if isinstance(data, list) else []:
+        if not isinstance(rec, dict):
             continue
+        found = re.search(r"\$m=(\d+)", str(rec.get("hash_to_verify", "")))
+        if not found:
+            continue
+        try:
+            bid = int(rec.get("block_id") or 0)
+        except (TypeError, ValueError):
+            bid = 0
+        if bid >= best_id:
+            best_id, best_m = bid, int(found.group(1))
+    return best_m
+
+
+def _fetch_difficulty() -> tuple[int | None, str]:
+    try:
+        req = urllib.request.Request(POOL_DIFF, headers={"User-Agent": "xnm-summary"})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+        value = int(data.get("difficulty", data.get("diff", 0)))
+        if value:
+            return value, "pool"
+    except Exception:
+        pass
+    for url in (LASTBLOCK, LASTBLOCK_ALT):
+        value = _difficulty_from_lastblock(url)
+        if value:
+            return value, "ostatni blok"
     return None, ""
 
 
