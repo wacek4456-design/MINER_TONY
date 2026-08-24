@@ -27,6 +27,7 @@ PATTERN = sys.argv[1] if len(sys.argv) > 1 else "/root/xnm-gpu*"
 REFRESH_S = 3.0
 STALE_AFTER_S = 90.0          # samples land every 30s
 RESTART_GAP_S = 300.0        # a bigger hole between samples means a restart
+QUEUE_SCAN_S = 30.0          # blocks.db parse is slow on a big queue
 DIFF_POLL_S = 20.0
 
 POOL_DIFF = "http://xenblocks.io/difficulty"
@@ -39,6 +40,7 @@ C = {
 }
 
 NET = {"difficulty": None, "source": "", "at": 0.0}
+QUEUE_MIX = {"at": 0.0, "counts": {"XNM": 0, "XBLK": 0, "XUNI": 0}}
 _lock = threading.Lock()
 
 
@@ -145,6 +147,40 @@ def run_start_ts(path: str) -> float:
             start = ts
         prev = ts
     return start
+
+
+def queue_breakdown(dirs) -> dict:
+    """What is still WAITING, by type, across every card.
+
+    The XNM/XBLK columns count blocks the pool already accepted today, so a
+    fresh instance shows zeros there while the queue fills up - which reads as
+    if the queued blocks had no type. They do: blocks.db stores block_type per
+    entry, so nothing has to be re-classified here.
+
+    Parsing that file costs real time once the queue is tens of thousands of
+    blocks, so refresh it on a slow timer rather than on every 3s repaint. The
+    mix barely moves between frames; the trade is that this line can lag the
+    Queue column slightly, since the db is written less often than samples.
+    """
+    now = time.time()
+    if now - QUEUE_MIX["at"] < QUEUE_SCAN_S:
+        return QUEUE_MIX["counts"]
+    counts = {"XNM": 0, "XBLK": 0, "XUNI": 0}
+    for d in dirs:
+        try:
+            with open(os.path.join(d, "data", "blocks.db"), "r",
+                      encoding="utf-8", errors="replace") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        for item in data.get("pending") or []:
+            kind = item.get("block_type") or "XNM"
+            if kind not in ("XUNI", "XBLK"):
+                kind = "XNM"          # same bucketing as BlockStore::pending_by_type
+            counts[kind] += 1
+    QUEUE_MIX["at"] = now
+    QUEUE_MIX["counts"] = counts
+    return counts
 
 
 def mining_day() -> str:
@@ -348,6 +384,10 @@ def render(dirs, cards) -> str:
         f"Dzis przyjete: XNM {tot['XNM']}  XBLK {tot['XBLK']}  XUNI {tot['XUNI']}"
         f"   (doba liczona od 01:00)", "dim"))
     if tot_queue:
+        q = queue_breakdown(dirs)
+        lines.append(paint(
+            f"W kolejce:     XNM {q['XNM']}  XBLK {q['XBLK']}  XUNI {q['XUNI']}"
+            f"   (odswiezane co {int(QUEUE_SCAN_S)} s)", "dim"))
         lines.append(paint(
             f"Kolejka {tot_queue} blok(ow) czeka na okno m=100 - nie kasuj instancji, "
             "dopoki nie zejdzie do zera.", "yellow"))
