@@ -29,6 +29,8 @@ set -euo pipefail
 
 WALLET="${1:-${MINER_ADDR:-0x9d79B1921b75AC7C199314406f5398E15f2fb47C}}"
 REPO="${XNM_REPO:-https://github.com/badnob/xnminer-linux-test.git}"
+# Zapasowe zrodla, gdy repozytorium autora zniknie (a zniknelo 2026-08-24).
+SRC_TAR="${XNM_SRC_TAR:-https://raw.githubusercontent.com/wacek4456-design/MINER_TONY/main/xnminer-src.tar.gz}"
 BASE="${XNM_BASE:-/root/xnminer-cuda}"
 SESSION="xnm"
 MAX_GPUS="${XNM_MAX_GPUS:-8}"
@@ -101,7 +103,15 @@ fi
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 
 # --- 3. source + build once -------------------------------------------------
-if [ -d "$BASE/.git" ]; then
+# Bez tego git PYTA O HASLO i skrypt wisi w nieskonczonosc, gdy repozytorium
+# zniknelo - GitHub odpowiada prosba o login zamiast 404, zeby nie zdradzac,
+# czy repo jest prywatne czy nie istnieje. Dokladnie to sie stalo z
+# badnob/xnminer-linux-test (404 od 2026-08-24).
+export GIT_TERMINAL_PROMPT=0
+export GIT_ASKPASS=/bin/true
+export GIT_CONFIG_NOSYSTEM=1
+
+if [ -d "$BASE/.git" ] || [ -f "$BASE/CMakeLists.txt" ]; then
   log "Source present - updating"
   # Our patches live on top of a PRISTINE tree, so drop them before pulling.
   # Otherwise --ff-only is blocked by local changes, and a NEWER patch set finds
@@ -112,7 +122,17 @@ if [ -d "$BASE/.git" ]; then
   git -C "$BASE" pull --ff-only >/dev/null 2>&1 || log "pull skipped"
 else
   log "Cloning ${REPO}"
-  git clone --depth 1 "$REPO" "$BASE"
+  if ! git clone --depth 1 "$REPO" "$BASE" 2>/dev/null; then
+    # Repozytorium autora potrafi zniknac. Wtedy bierzemy kopie zrodel z
+    # naszego repo - to ten sam, NIETKNIETY drzewko, wiec latki wchodza tak samo.
+    log "Clone failed (repo gone or private) - falling back to source tarball"
+    rm -rf "$BASE"
+    mkdir -p "$BASE"
+    wget -qO /tmp/xnminer-src.tar.gz "$SRC_TAR"       || die "cannot fetch sources: neither ${REPO} nor ${SRC_TAR} is reachable"
+    tar -xzf /tmp/xnminer-src.tar.gz -C "$BASE"       || die "source tarball is corrupt"
+    [ -f "$BASE/CMakeLists.txt" ] || die "source tarball has no CMakeLists.txt"
+    log "Sources restored from tarball"
+  fi
 fi
 cd "$BASE"
 chmod +x ./*.sh
