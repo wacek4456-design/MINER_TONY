@@ -29,6 +29,7 @@ STALE_AFTER_S = 90.0          # samples land every 30s
 RESTART_GAP_S = 300.0        # a bigger hole between samples means a restart
 QUEUE_SCAN_S = 30.0          # blocks.db parse is slow on a big queue
 BLOCK_STALE_S = 600.0        # lastblock feed froze for 49 min once; flag it
+QUEUE_WARN = 500             # ponizej tego kolejka to normalny przeplyw
 DIFF_POLL_S = 20.0
 
 POOL_DIFF = "http://xenblocks.io/difficulty"
@@ -43,7 +44,7 @@ C = {
 }
 
 NET = {"target": None, "src": "", "block": None, "block_age": None, "at": 0.0}
-QUEUE_MIX = {"at": 0.0, "counts": {"XNM": 0, "XBLK": 0, "XUNI": 0}}
+QUEUE_MIX = {"at": 0.0, "counts": {"XNM": 0, "XBLK": 0, "XUNI": 0, "m": {}}}
 _lock = threading.Lock()
 
 
@@ -225,7 +226,7 @@ def queue_breakdown(dirs) -> dict:
     now = time.time()
     if now - QUEUE_MIX["at"] < QUEUE_SCAN_S:
         return QUEUE_MIX["counts"]
-    counts = {"XNM": 0, "XBLK": 0, "XUNI": 0}
+    counts = {"XNM": 0, "XBLK": 0, "XUNI": 0, "m": {}}
     for d in dirs:
         try:
             with open(os.path.join(d, "data", "blocks.db"), "r",
@@ -238,6 +239,14 @@ def queue_breakdown(dirs) -> dict:
             if kind not in ("XUNI", "XBLK"):
                 kind = "XNM"          # same bucketing as BlockStore::pending_by_type
             counts[kind] += 1
+            # Na jakie m czekaja - kiedys bylo zaszyte "m=100", co po zmianie
+            # sieci na minimum 10000 zaczelo klamac.
+            mc = item.get("memory_cost")
+            if not isinstance(mc, int) or mc <= 0:
+                found = re.search(r"\$m=(\d+)", str(item.get("hash_str") or ""))
+                mc = int(found.group(1)) if found else None
+            if mc:
+                counts["m"][mc] = counts["m"].get(mc, 0) + 1
     QUEUE_MIX["at"] = now
     QUEUE_MIX["counts"] = counts
     return counts
@@ -464,12 +473,17 @@ def render(dirs, cards) -> str:
         f"   (doba liczona od 01:00)", "dim"))
     if tot_queue:
         q = queue_breakdown(dirs)
+        czeka = ", ".join("m=%d" % m for m, _ in
+                          sorted(q["m"].items(), key=lambda kv: -kv[1])[:3]) or "?"
         lines.append(paint(
             f"W kolejce:     XNM {q['XNM']}  XBLK {q['XBLK']}  XUNI {q['XUNI']}"
-            f"   (odswiezane co {int(QUEUE_SCAN_S)} s)", "dim"))
-        lines.append(paint(
-            f"Kolejka {tot_queue} blok(ow) czeka na okno m=100 - nie kasuj instancji, "
-            "dopoki nie zejdzie do zera.", "yellow"))
+            f"   (czekaja na {czeka}, odswiezane co {int(QUEUE_SCAN_S)} s)", "dim"))
+        # Ostrzezenie tylko gdy kolejka NAPRAWDE rosnie. Przy kopaniu na biezaco
+        # kilka blokow w kolejce to normalny przeplyw, a nie zapas do pilnowania.
+        if tot_queue >= QUEUE_WARN:
+            lines.append(paint(
+                f"Kolejka urosla do {tot_queue} blok(ow) - zgloszenia nie dochodza do puli. "
+                "Nie kasuj instancji, dopoki nie zejdzie.", "yellow"))
     lines.append(paint(
         "Ctrl+B potem cyfra = karta   |   Ctrl+C zamyka TYLKO ten podglad, "
         "nie minery", "dim"))
