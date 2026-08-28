@@ -18,6 +18,9 @@
 #   XNM_LANES=8         CUDA lanes per card
 #   XNM_DRAIN_PAR=64    parallel /verify workers per card while draining
 #                       (4 cards x 64 = 256 concurrent; 128 got an IP blocked)
+#   XNM_HOARD=0         0 = kop przy trudnosci sieci i wysylaj na biezaco
+#                       1 = zbieraj zapas przy m=100 (nieaktualne od 2026-08-24,
+#                           gdy siec ustawila minimum na 10000)
 #   XNM_REPO=<url>      source repository
 # Re-exec under bash if started as `sh script.sh`: dash chokes on the [[ =~ ]]
 # address check below, and the failure looks nothing like its cause.
@@ -33,15 +36,34 @@ VRAM_PCT="${XNM_VRAM_PCT:-79.0}"
 LANES="${XNM_LANES:-8}"
 # 64 is the PROVEN value: hours of clean windows at 4x64 concurrent with ~8%
 # dropped connections.
-# ⚠ 128 was tried and looks like it got the host's IP blocked. At 4x128 = 512
-# concurrent connections the drop rate went 8% -> 82% within one wave, then the
-# pool's port 80 stopped answering that host entirely - while the SAME endpoint
-# kept serving fine through a third-party proxy from another network, and while
-# port 80 to other sites still worked from the host. A fresh instance repeated
-# it: healthy on arrival, dead within ~15 minutes of its first flush at 128.
-# The pool tolerates the traffic, not the concurrency. Do not raise this without
-# watching "dropped" over a full window first, and drop to 32 if it recurs.
+# ⚠ 128 was tried and the drop rate went 8% -> 82% within one wave, after which
+# the pool's port 80 stopped answering that host. It was FIRST read as the pool
+# blocking the IP - that reading is NOT established. The collapse happened
+# inside an m=100 window, and port 80 also fails from unrelated networks during
+# those windows (home 0/10, a European VPS 0/10, even an external proxy), while
+# working 5/5 from the same home line at m=1100. Congestion when the whole
+# network dumps its m=100 hoards explains it at least as well as a block.
+# Either way 64 is the value with hours of clean windows behind it. Do not
+# raise without watching "dropped" across a full window first.
 DRAIN_PAR="${XNM_DRAIN_PAR:-64}"
+
+# XNM_HOARD=1 wraca do zbierania zapasu przy m=100 (dawne zachowanie).
+# Domyslnie WYLACZONE: 2026-08-24 siec ustawila minimalna trudnosc na
+# 10000, wiec okna m=100 przestaly istniec, a zapas zbierany przy setce
+# nie ma jak zostac wyslany. W trybie zwyklym miner kopie przy trudnosci
+# sieci i wysyla na biezaco - nic nie zalega, wiec utrata maszyny nie
+# kosztuje nic poza biezaca sekunda.
+HOARD="${XNM_HOARD:-0}"
+if [ "$HOARD" = "1" ]; then
+  MINE_M=100; DRAIN_ON=true
+else
+  MINE_M=0                    # 0 = kop przy trudnosci sieci
+  # Przy kopaniu na biezaco match-drain tylko szkodzi: gdy kanal lastblock
+  # zamarznie (a potrafi - zmierzone 49 minut), miner uznaje, ze trwa okno,
+  # i PARKUJE karte. Zmierzone u innego uzytkownika: GPU 24% -> 99% po
+  # wylaczeniu. Kolejka i tak sie oprozni zwyklym "queue service".
+  DRAIN_ON=false
+fi
 
 log() { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31mERROR:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -384,6 +406,8 @@ for i in $(seq 0 $((GPUS - 1))); do
   sed -i "s|^target_vram_pct =.*|target_vram_pct = ${VRAM_PCT}|" miner.ini
   sed -i "s|^max_lanes =.*|max_lanes = ${LANES}|"              miner.ini
   sed -i "s|^match_drain_parallel =.*|match_drain_parallel = ${DRAIN_PAR}|" miner.ini
+  sed -i "s|^force_mine_memory_cost =.*|force_mine_memory_cost = ${MINE_M}|" miner.ini
+  sed -i "s|^match_drain_enabled =.*|match_drain_enabled = ${DRAIN_ON}|" miner.ini
   sed -i "s|^woodyminer_custom_name =.*|woodyminer_custom_name = xnm-gpu${i}|" miner.ini
   echo "  GPU${i} -> ${DIR}"
   cd "$BASE"
